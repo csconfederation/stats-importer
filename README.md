@@ -10,6 +10,8 @@ or if building/running with cargo
 
 `cargo run -- --directory /path/to/demo/directory`
 
+Note: CSC-Stats will need to have read access to this directory
+
 use `--season` and `--tier` flags when importing demos that do not have data in CSC-Core.
 
 ### Other Info
