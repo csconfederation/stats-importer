@@ -16,6 +16,8 @@ use `--season` and `--tier` flags when importing demos that do not have data in 
 
 ### Other Info
 
+- Handles .zip files
+
 - Demos can be re-imported even if they exist in the stats DB.
 
 - `--help` exists
