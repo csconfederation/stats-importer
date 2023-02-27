@@ -2,6 +2,8 @@
 
 ## Usage
 
+First place demo files to be processed in a directory
+
 Fill out `.env` from `.example.env` and run
 
 `stats-importer --directory /path/to/demo/directory`
