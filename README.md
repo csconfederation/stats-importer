@@ -8,7 +8,7 @@ Fill out `.env` from `.example.env` and run
 
 or if building/running with cargo
 
-`cargo run -- --directory /path/to/demo/directory`
+`cargo run --release -- --directory /path/to/demo/directory`
 
 Note: CSC-Stats will need to have read access to this directory
 
