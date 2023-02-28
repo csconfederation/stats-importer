@@ -61,6 +61,7 @@ async fn main() {
                 let exsiting = dir.join(&filename);
                 println!("{}", exsiting.display());
                 let p = dir.join("_completed").join(&filename);
+                println!("moving to: {}", p.display());
                 fs::rename(&exsiting, p).unwrap();
                 println!("Processed {} successfully", filename);
             }
@@ -68,6 +69,7 @@ async fn main() {
                 println!("Skipping {}, error: {}", filename, err);
                 let p = dir.join("_skipped").join(&filename);
                 let exsiting = dir.join(&filename);
+                println!("moving to: {}", p.display());
                 fs::rename(&exsiting, p).unwrap();
             }
         }
