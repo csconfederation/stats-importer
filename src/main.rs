@@ -67,6 +67,7 @@ async fn main() {
             }
             Err(err) => {
                 println!("Skipping {}, error: {}", filename, err);
+                let filename = filename.replace(".zip", "");
                 let p = dir.join("_skipped").join(&filename);
                 let exsiting = dir.join(&filename);
                 println!("moving to: {}", p.display());
