@@ -107,13 +107,19 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
     if is_zip {
         file_path = unzip_file(path.clone(), &args.directory)?;
     }
+    let req_root_dir = env::var("REQUEST_ROOT_DIR");
+    let req_path = match req_root_dir {
+        Ok(root_dir) => format!("{}/{}", root_dir, filename),
+        Err(_) => file_path,
+    };
+    println!("{}", &req_path);
     let client = reqwest::Client::new();
     let url = format!(
         "{}/api/add-match",
         env::var("STATS_API_URL").expect("STATS_API_URL expected")
     );
     let body = StatsRequestBody {
-        path: file_path,
+        path: req_path,
         match_id: match_info.match_id.unwrap(),
         season: match_info.season,
         tier: match_info.tier,
