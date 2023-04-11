@@ -59,7 +59,6 @@ async fn main() {
         match handle_file(filename, &path, args.clone(), &pool).await {
             Ok(filename) => {
                 let exsiting = dir.join(&filename);
-                println!("{}", exsiting.display());
                 let p = dir.join("_completed").join(&filename);
                 println!("moving to: {}", p.display());
                 fs::rename(&exsiting, p).unwrap();
@@ -95,8 +94,9 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
             };
             MatchInfo {
                 match_id: Some(filename.clone().to_string()),
-                tier: tier,
+                tier,
                 season: i32::from(season),
+                is_series: false,
             }
         }
     };
@@ -112,15 +112,34 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Ok(root_dir) => format!("{}/{}", root_dir, filename),
         Err(_) => file_path,
     };
-    println!("{}", &req_path);
     let client = reqwest::Client::new();
     let url = format!(
         "{}/api/add-match",
         env::var("STATS_API_URL").expect("STATS_API_URL expected")
     );
+
+    let map_num_str = if match_info.is_series {
+        let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
+        let map_number = match map_number_re.captures(filename) {
+            Some(captures) => {
+                let c = captures.get(0).unwrap().as_str();
+                let num_char = c.chars().last().unwrap();
+                let map_num = num_char.to_string().parse::<i32>()?;
+                map_num
+            }
+            None => {
+                return Err(anyhow!(
+                    "cannot parse series map number from filename, skipping..."
+                ));
+            }
+        };
+        format!("_{}", map_number)
+    } else {
+        String::new()
+    };
     let body = StatsRequestBody {
         path: req_path,
-        match_id: match_info.match_id.unwrap(),
+        match_id: format!("{}{}", match_info.match_id.unwrap(), map_num_str),
         season: match_info.season,
         tier: match_info.tier,
     };
@@ -145,13 +164,14 @@ struct MatchInfo {
     match_id: Option<String>,
     season: i32,
     tier: String,
+    is_series: bool,
 }
 
 async fn get_core_match(id: i64, pool: &PgPool) -> Result<MatchInfo> {
     Ok(sqlx::query_as!(
         MatchInfo,
         "
-        select mm.id::varchar as match_id, ls.number as season, pt.name as tier
+        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
                 join leagues_seasons ls on ls.id = lm.season_id
