@@ -1,6 +1,6 @@
 {
   "db": "PostgreSQL",
-  "4144a986418aae994aac5d7e50ef9095b2337fd073b7b1c6a2efc383956a099e": {
+  "7ac03fb9a44eed2b8c1b91aec18098f92c84587074a2b79c2c5a8c400f3d2ce2": {
     "describe": {
       "columns": [
         {
@@ -17,10 +17,16 @@
           "name": "tier",
           "ordinal": 2,
           "type_info": "Varchar"
+        },
+        {
+          "name": "is_series",
+          "ordinal": 3,
+          "type_info": "Bool"
         }
       ],
       "nullable": [
         null,
+        false,
         false,
         false
       ],
@@ -30,6 +36,6 @@
         ]
       }
     },
-    "query": "\n        select mm.id::varchar as match_id, ls.number as season, pt.name as tier\n            from matches_matches mm\n                join leagues_matchday lm on lm.id = mm.match_day_id\n                join leagues_seasons ls on ls.id = lm.season_id\n                join teams_teams tt on mm.home_id = tt.id\n                join players_tiers pt on tt.tier_id = pt.id\n        where mm.id = $1;\n    "
+    "query": "\n        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series\n            from matches_matches mm\n                join leagues_matchday lm on lm.id = mm.match_day_id\n                join leagues_seasons ls on ls.id = lm.season_id\n                join teams_teams tt on mm.home_id = tt.id\n                join players_tiers pt on tt.tier_id = pt.id\n        where mm.id = $1;\n    "
   }
 }
