@@ -194,8 +194,8 @@ fn unzip_file(path: PathBuf, dir: &String) -> Result<String> {
         None => return Err(anyhow!("Zip contains no file".to_owned())),
     };
 
-    // println!("{:#?}", &path.as_os_str());
     let new_path = format!("{}/{}", dir, &outpath.display());
+    println!("Unzipping to: {:#?}", &new_path);
     let mut outfile = fs::File::create(&new_path).unwrap();
     io::copy(&mut file, &mut outfile)?;
     fs::remove_file(path)?;
