@@ -81,7 +81,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Some(captures) => {
             let mid = captures.get(0).unwrap().as_str();
             let id = mid.replace("-", "").replace("mid", "").parse::<i64>()?;
-            let mut info = get_core_match(id, pool).await?;
+            let mut info = get_core_match(id, pool, filename.contains("combine"), &args).await?;
             info.match_id = if filename.contains("combine") {
                 Some(format!("combines-{}", info.match_id.unwrap()))
             } else {
@@ -166,11 +166,22 @@ struct MatchInfo {
     tier: String,
     is_series: bool,
 }
+#[derive(Debug, FromRow, Clone)]
+struct CombineMatch {
+    match_id: Option<String>,
+    tier: String,
+}
 
-async fn get_core_match(id: i64, pool: &PgPool) -> Result<MatchInfo> {
-    Ok(sqlx::query_as!(
-        MatchInfo,
-        "
+async fn get_core_match(
+    id: i64,
+    pool: &PgPool,
+    is_combine: bool,
+    args: &Args,
+) -> Result<MatchInfo> {
+    if !is_combine {
+        Ok(sqlx::query_as!(
+            MatchInfo,
+            "
         select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
@@ -179,8 +190,31 @@ async fn get_core_match(id: i64, pool: &PgPool) -> Result<MatchInfo> {
                 join players_tiers pt on tt.tier_id = pt.id
         where mm.id = $1;
     ",
-        id
-    )
-    .fetch_one(pool)
-    .await?)
+            id
+        )
+        .fetch_one(pool)
+        .await?)
+    } else {
+        let m = sqlx::query_as!(
+            CombineMatch,
+            "
+        select mm.id::varchar as match_id, pt.name as tier
+            from matches_combinematches mm
+                join players_tiers pt on mm.tier_id = pt.id
+        where mm.id = $1;
+    ",
+            id
+        )
+        .fetch_one(pool)
+        .await?;
+        let Some(season) = args.season else {
+            return Err(anyhow!("--season not provided for combine match"));
+        };
+        Ok(MatchInfo {
+            match_id: m.match_id,
+            season: season.try_into().unwrap(),
+            tier: m.tier,
+            is_series: false,
+        })
+    }
 }
