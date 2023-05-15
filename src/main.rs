@@ -1,7 +1,6 @@
 use std::{
     env,
-    fs::{self, File},
-    io,
+    fs::{self},
     path::{Path, PathBuf},
 };
 
@@ -82,7 +81,13 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Some(captures) => {
             let mid = captures.get(0).unwrap().as_str();
             let id = mid.replace("-", "").replace("mid", "").parse::<i64>()?;
-            get_core_match(id, pool).await?
+            let mut info = get_core_match(id, pool).await?;
+            info.match_id = if filename.contains("combine") {
+                Some(format!("combines-{}", info.match_id.unwrap()))
+            } else {
+                info.match_id
+            };
+            info
         }
         None => {
             println!("Cannot parse match id from filename, using args...");
@@ -101,12 +106,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         }
     };
 
-    let mut file_path = String::from(path.as_path().to_str().unwrap());
-
-    let is_zip = path.extension().unwrap() == "zip";
-    if is_zip {
-        file_path = unzip_file(path.clone(), &args.directory)?;
-    }
+    let file_path = String::from(path.as_path().to_str().unwrap());
     let req_root_dir = env::var("REQUEST_ROOT_DIR");
     let req_path = match req_root_dir {
         Ok(root_dir) => format!("{}/{}", root_dir, filename),
@@ -159,7 +159,7 @@ struct StatsRequestBody {
     season: i32,
     tier: String,
 }
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, Clone)]
 struct MatchInfo {
     match_id: Option<String>,
     season: i32,
@@ -183,31 +183,4 @@ async fn get_core_match(id: i64, pool: &PgPool) -> Result<MatchInfo> {
     )
     .fetch_one(pool)
     .await?)
-}
-
-fn unzip_file(path: PathBuf, dir: &String) -> Result<String> {
-    let file = File::open(&path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    let mut file = archive.by_index(0).unwrap();
-    let outpath = match file.enclosed_name() {
-        Some(path) => path.to_owned(),
-        None => return Err(anyhow!("Zip contains no file".to_owned())),
-    };
-
-    let new_path = format!("{}/{}", dir, &outpath.display());
-    println!("Unzipping to: {:#?}", &new_path);
-    let mut outfile = fs::File::create(&new_path).unwrap();
-    io::copy(&mut file, &mut outfile)?;
-    fs::remove_file(path)?;
-
-    // Get and Set permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        if let Some(mode) = file.unix_mode() {
-            fs::set_permissions(&new_path, fs::Permissions::from_mode(mode)).unwrap();
-        }
-    }
-    Ok(String::from(new_path))
 }
