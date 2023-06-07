@@ -24,6 +24,10 @@ struct Args {
     /// override season (optional)
     #[arg(short, long)]
     season: Option<u8>,
+
+    /// override match_day (optional)
+    #[arg(short, long)]
+    match_day: Option<String>,
 }
 
 #[tokio::main]
@@ -97,10 +101,14 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
             let Some(tier) = args.tier else {
                return Err(anyhow!("--tier arg not provided, skipping..."));
             };
+            let Some(match_day) = args.match_day else {
+               return Err(anyhow!("--match_day arg not provided, skipping..."));
+            };
             MatchInfo {
                 match_id: Some(filename.clone().to_string()),
                 tier,
                 season: i32::from(season),
+                match_day,
                 is_series: false,
             }
         }
@@ -142,6 +150,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         match_id: format!("{}{}", match_info.match_id.unwrap(), map_num_str),
         season: match_info.season,
         tier: match_info.tier,
+        match_day: match_info.match_day,
     };
     let resp = client.post(url).json(&body).send().await?;
     if resp.status() != 200 {
@@ -158,12 +167,14 @@ struct StatsRequestBody {
     match_id: String,
     season: i32,
     tier: String,
+    match_day: String,
 }
 #[derive(Debug, FromRow, Clone)]
 struct MatchInfo {
     match_id: Option<String>,
     season: i32,
     tier: String,
+    match_day: String,
     is_series: bool,
 }
 #[derive(Debug, FromRow, Clone)]
@@ -182,7 +193,7 @@ async fn get_core_match(
         Ok(sqlx::query_as!(
             MatchInfo,
             "
-        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series
+        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
                 join leagues_seasons ls on ls.id = lm.season_id
@@ -214,6 +225,7 @@ async fn get_core_match(
             match_id: m.match_id,
             season: season.try_into().unwrap(),
             tier: m.tier,
+            match_day: String::new(),
             is_series: false,
         })
     }
