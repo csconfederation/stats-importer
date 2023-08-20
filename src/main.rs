@@ -145,12 +145,18 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
     } else {
         String::new()
     };
+    let match_type = if match_info.match_id.as_ref().expect("Match ID is Null").contains("combines"){
+        Some("Combines".to_string())
+    }else{
+        None
+    };
     let body = StatsRequestBody {
         path: req_path,
         match_id: format!("{}{}", match_info.match_id.unwrap(), map_num_str),
         season: match_info.season,
         tier: match_info.tier,
         match_day: match_info.match_day,
+        match_type: match_type
     };
     let resp = client.post(url).json(&body).send().await?;
     if resp.status() != 200 {
@@ -168,6 +174,7 @@ struct StatsRequestBody {
     season: i32,
     tier: String,
     match_day: String,
+    match_type: Option<String>,
 }
 #[derive(Debug, FromRow, Clone)]
 struct MatchInfo {
