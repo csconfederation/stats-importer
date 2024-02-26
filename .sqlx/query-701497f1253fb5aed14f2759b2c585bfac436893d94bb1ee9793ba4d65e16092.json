@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day, ht.name as home_team_name, at.name as away_team_name, ml.home_side as home_start_side\n            from matches_matches mm\n                join leagues_matchday lm on lm.id = mm.match_day_id\n                join leagues_seasons ls on ls.id = lm.season_id\n                join teams_teams ht on mm.home_id = ht.id\n                join teams_teams at on mm.away_id = at.id\n                join players_tiers pt on ht.tier_id = pt.id\n                join matches_matchlobby ml on ml.id = mm.lobby_id\n        where mm.id = $1;\n    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "match_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "season",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "tier",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_series",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "match_day",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "home_team_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "away_team_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "home_start_side",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "701497f1253fb5aed14f2759b2c585bfac436893d94bb1ee9793ba4d65e16092"
+}
