@@ -153,7 +153,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         _s if match_info.is_series => "Playoff".to_string(),
         _ => "Regulation".to_string(),
     };
-    let override_team_names = if match_type != "Combine" {
+    let override_team_names = if match_type == "Regulation" {
         match match_info.home_start_side.as_str() {
             "CT" => Ok((
                 Some(match_info.home_team_name),
