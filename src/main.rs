@@ -28,6 +28,10 @@ struct Args {
     /// override match_day (optional)
     #[arg(short, long)]
     match_day: Option<String>,
+
+    /// override team names from core home/away team data
+    #[arg(short, long)]
+    override_team_names: Option<bool>,
 }
 
 #[tokio::main]
@@ -123,11 +127,6 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Ok(root_dir) => format!("{}/{}", root_dir, filename),
         Err(_) => file_path,
     };
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/add-match",
-        env::var("STATS_API_URL").expect("STATS_API_URL expected")
-    );
 
     let map_num_str = if match_info.is_series {
         let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
@@ -153,25 +152,26 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         _s if match_info.is_series => "Playoff".to_string(),
         _ => "Regulation".to_string(),
     };
-    let override_team_names = if match_type == "Regulation" {
-        match match_info.home_start_side.as_str() {
-            "CT" => Ok((
-                Some(match_info.home_team_name),
-                Some(match_info.away_team_name),
-            )),
-            "T" => Ok((
-                Some(match_info.away_team_name),
-                Some(match_info.home_team_name),
-            )),
-            &_ => Err(anyhow!(
-                "invalid home_start_side: {} for match_id: {}",
-                match_info.home_start_side.clone(),
-                match_info.match_id.clone().unwrap_or("unknown".to_string())
-            )),
-        }
-    } else {
-        Ok((None, None))
-    };
+    let override_team_names =
+        if match_type == "Regulation" && args.override_team_names.unwrap_or(false) {
+            match match_info.home_start_side.as_str() {
+                "CT" => Ok((
+                    Some(match_info.home_team_name),
+                    Some(match_info.away_team_name),
+                )),
+                "T" => Ok((
+                    Some(match_info.away_team_name),
+                    Some(match_info.home_team_name),
+                )),
+                &_ => Err(anyhow!(
+                    "invalid home_start_side: {} for match_id: {}",
+                    match_info.home_start_side.clone(),
+                    match_info.match_id.clone().unwrap_or("unknown".to_string())
+                )),
+            }
+        } else {
+            Ok((None, None))
+        };
     let Ok(override_team_names) = override_team_names else {
         return Err(override_team_names.err().unwrap());
     };
@@ -185,6 +185,11 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         override_ct_start_team_name: override_team_names.0,
         override_t_start_team_name: override_team_names.1,
     };
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/add-match",
+        env::var("STATS_API_URL").expect("STATS_API_URL expected")
+    );
     let resp = client.post(url).json(&body).send().await?;
     if resp.status() != 200 {
         return Err(anyhow!("{}", resp.status()));
