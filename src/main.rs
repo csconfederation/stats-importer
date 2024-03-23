@@ -29,9 +29,13 @@ struct Args {
     #[arg(short, long)]
     match_day: Option<String>,
 
-    /// override team names from core home/away team data
-    #[arg(short, long)]
-    override_team_names: Option<bool>,
+    /// fix core match stats scores (optional)
+    #[arg(long)]
+    fix_core_scores: Option<bool>,
+
+    /// fix demo team names (optional)
+    #[arg(long)]
+    fix_team_names: Option<bool>,
 }
 
 #[tokio::main]
@@ -114,9 +118,6 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 season: i32::from(season),
                 match_day,
                 is_series: false,
-                home_team_name: String::new(),
-                away_team_name: String::new(),
-                home_start_side: String::new(),
             }
         }
     };
@@ -152,29 +153,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         _s if match_info.is_series => "Playoff".to_string(),
         _ => "Regulation".to_string(),
     };
-    let override_team_names =
-        if match_type == "Regulation" && args.override_team_names.unwrap_or(false) {
-            match match_info.home_start_side.as_str() {
-                "CT" => Ok((
-                    Some(match_info.home_team_name),
-                    Some(match_info.away_team_name),
-                )),
-                "T" => Ok((
-                    Some(match_info.away_team_name),
-                    Some(match_info.home_team_name),
-                )),
-                &_ => Err(anyhow!(
-                    "invalid home_start_side: {} for match_id: {}",
-                    match_info.home_start_side.clone(),
-                    match_info.match_id.clone().unwrap_or("unknown".to_string())
-                )),
-            }
-        } else {
-            Ok((None, None))
-        };
-    let Ok(override_team_names) = override_team_names else {
-        return Err(override_team_names.err().unwrap());
-    };
+
     let body = StatsRequestBody {
         path: req_path,
         match_id: format!("{}{}", match_info.match_id.unwrap(), map_num_str),
@@ -182,8 +161,8 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         tier: match_info.tier,
         match_day: match_info.match_day,
         match_type,
-        override_ct_start_team_name: override_team_names.0,
-        override_t_start_team_name: override_team_names.1,
+        fix_core_scores: args.fix_core_scores.unwrap_or(false),
+        fix_team_names: args.fix_team_names.unwrap_or(false),
     };
     let client = reqwest::Client::new();
     let url = format!(
@@ -207,8 +186,8 @@ struct StatsRequestBody {
     tier: String,
     match_day: String,
     match_type: String,
-    override_t_start_team_name: Option<String>,
-    override_ct_start_team_name: Option<String>,
+    fix_core_scores: bool,
+    fix_team_names: bool,
 }
 #[derive(Debug, FromRow, Clone)]
 struct MatchInfo {
@@ -217,9 +196,6 @@ struct MatchInfo {
     tier: String,
     match_day: String,
     is_series: bool,
-    home_team_name: String,
-    away_team_name: String,
-    home_start_side: String,
 }
 
 #[derive(Debug, FromRow, Clone)]
@@ -238,7 +214,7 @@ async fn get_core_match(
         Ok(sqlx::query_as!(
             MatchInfo,
             r#"
-        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day, ht.name as home_team_name, at.name as away_team_name, ml.home_side as home_start_side
+        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
                 join leagues_seasons ls on ls.id = lm.season_id
@@ -274,9 +250,6 @@ async fn get_core_match(
             tier: m.tier,
             match_day: String::new(),
             is_series: false,
-            home_team_name: String::new(),
-            away_team_name: String::new(),
-            home_start_side: String::new(),
         })
     }
 }
