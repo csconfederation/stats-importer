@@ -2,11 +2,12 @@
 name = "stats-importer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.1.6", features = ["derive"] }
+clap = { version = "4.1.6", features = ["derive", "env"] }
 dotenvy = "*"
 zip = "0.6.4"
 regex = "*"
@@ -14,7 +15,12 @@ anyhow = "1.0.69"
 thiserror = "1.0.38"
 sqlx = { version = "0.8.6", features = [ "runtime-tokio-rustls", "postgres", "macros"] }
 tokio = { version= "1.25.0", features = ["full"] }
-reqwest = { version = "0.11.14", default-features = false, features = ["rustls-tls", "json"] }
-serde = "1.0.152"
+reqwest = { version = "0.11.14", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.93"
-
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
+walkdir = "2"
+futures-util = "0.3"
+fs2 = "0.4"

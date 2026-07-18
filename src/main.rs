@@ -5,17 +5,22 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
+mod backfill;
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// demos directory
     #[arg(short, long)]
-    directory: String,
+    directory: Option<String>,
 
     /// override tier (optional)
     #[arg(short, long)]
@@ -38,13 +43,33 @@ struct Args {
     fix_team_names: Option<bool>,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum Command {
+    /// Inventory or repair historical round-player stats for one Core season.
+    Backfill(backfill::BackfillArgs),
+}
+
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().expect(".env not found");
+    dotenvy::dotenv().ok();
     let args = Args::parse();
-    let dir = Path::new(&args.directory);
+    if let Some(Command::Backfill(backfill_args)) = &args.command {
+        if let Err(error) = backfill::run(backfill_args.clone()).await {
+            eprintln!("backfill failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let Some(directory) = &args.directory else {
+        eprintln!(
+            "--directory is required for legacy import mode (or use the backfill subcommand)"
+        );
+        std::process::exit(2);
+    };
+    let dir = Path::new(directory);
     if !dir.is_dir() {
-        println!("'{}' is not a directory", args.directory);
+        println!("'{}' is not a directory", directory);
         return;
     }
     println!("Importing from {:?}", dir.as_os_str());
@@ -211,8 +236,7 @@ async fn get_core_match(
     args: &Args,
 ) -> Result<MatchInfo> {
     if !is_combine {
-        Ok(sqlx::query_as!(
-            MatchInfo,
+        Ok(sqlx::query_as::<_, MatchInfo>(
             r#"
         select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day
             from matches_matches mm
@@ -224,21 +248,20 @@ async fn get_core_match(
                 join matches_matchlobby ml on ml.id = mm.lobby_id
         where mm.id = $1;
     "#,
-            id
         )
+        .bind(id)
         .fetch_one(pool)
         .await?)
     } else {
-        let m = sqlx::query_as!(
-            CombineMatch,
+        let m = sqlx::query_as::<_, CombineMatch>(
             "
         select mm.id::varchar as match_id, pt.name as tier
             from matches_combinematches mm
                 join players_tiers pt on mm.tier_id = pt.id
         where mm.id = $1;
     ",
-            id
         )
+        .bind(id)
         .fetch_one(pool)
         .await?;
         let Some(season) = args.season else {
