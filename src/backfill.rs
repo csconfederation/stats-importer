@@ -23,6 +23,10 @@ use walkdir::WalkDir;
 
 const B2_HOST: &str = "f005.backblazeb2.com";
 const B2_PATH_PREFIX: &str = "/file/csc-demo-archive/";
+const LEGACY_DO_HOSTS: [&str; 2] = [
+    "cscdemos.nyc3.digitaloceanspaces.com",
+    "cscdemos.nyc3.cdn.digitaloceanspaces.com",
+];
 
 #[derive(Args, Debug, Clone)]
 pub struct BackfillArgs {
@@ -178,13 +182,13 @@ impl ReviewedInventory {
                     line_number + 1
                 );
             }
-            if matches!(
-                event.status.as_str(),
-                "match_complete" | "skipped_forfeit" | "artifact_missing" | "artifact_unsupported"
-            ) {
+            if is_terminal_status(&event.status) {
                 terminal_matches.insert(event.match_id);
                 terminal_status.insert(event.match_id, event.status.clone());
-                if event.status == "match_complete" {
+                if matches!(
+                    event.status.as_str(),
+                    "match_complete" | "skipped_not_repairable"
+                ) {
                     let checksum = event
                         .evidence
                         .as_ref()
@@ -253,6 +257,24 @@ struct Ledger {
     completed: HashSet<(i32, String, i64)>,
 }
 
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "match_complete"
+            | "skipped_forfeit"
+            | "skipped_not_repairable"
+            | "artifact_missing"
+            | "artifact_unsupported"
+    )
+}
+
+fn is_clean_non_repairable(classification: Option<&str>) -> bool {
+    matches!(
+        classification,
+        Some("ingest_incomplete" | "no_matching_candidate" | "fingerprint_mismatch" | "ambiguous")
+    )
+}
+
 struct WorkspaceLock {
     _file: fs::File,
 }
@@ -275,7 +297,7 @@ impl Ledger {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -283,26 +305,46 @@ impl Ledger {
         file.try_lock_exclusive()
             .map_err(|error| anyhow!("ledger is already locked by another runner: {error}"))?;
         let mut completed = HashSet::new();
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            for (line_number, line) in content.lines().enumerate() {
-                if line.trim().is_empty() {
-                    continue;
+        let bytes = fs::read(&path)?;
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        let mut events = Vec::new();
+        for (line_number, line) in bytes[..complete_len]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let event: LedgerEvent = serde_json::from_slice(line)
+                .with_context(|| format!("invalid ledger JSON at line {}", line_number + 1))?;
+            events.push(event);
+        }
+        let trailing = &bytes[complete_len..];
+        if !trailing.iter().all(u8::is_ascii_whitespace) {
+            match serde_json::from_slice::<LedgerEvent>(trailing) {
+                Ok(event) => {
+                    events.push(event);
+                    file.write_all(b"\n")?;
+                    file.sync_all()?;
                 }
-                let event: LedgerEvent = serde_json::from_str(line)
-                    .with_context(|| format!("invalid ledger JSON at line {}", line_number + 1))?;
-                if event.schema_version != 1 {
-                    bail!("unsupported ledger schema version {}", event.schema_version);
+                Err(_) => {
+                    file.set_len(complete_len as u64)?;
+                    file.sync_all()?;
+                    eprintln!(
+                        "discarded an incomplete trailing ledger record at byte {complete_len}"
+                    );
                 }
-                if matches!(
-                    event.status.as_str(),
-                    "match_complete"
-                        | "skipped_forfeit"
-                        | "artifact_missing"
-                        | "artifact_unsupported"
-                ) {
-                    completed.insert((event.season, event.mode, event.match_id));
-                }
+            }
+        }
+        for event in events {
+            if event.schema_version != 1 {
+                bail!("unsupported ledger schema version {}", event.schema_version);
+            }
+            if is_terminal_status(&event.status) {
+                completed.insert((event.season, event.mode, event.match_id));
             }
         }
         Ok(Self { file, completed })
@@ -314,13 +356,11 @@ impl Ledger {
     }
 
     fn append(&mut self, event: LedgerEvent) -> Result<()> {
-        serde_json::to_writer(&mut self.file, &event)?;
-        self.file.write_all(b"\n")?;
+        let mut record = serde_json::to_vec(&event)?;
+        record.push(b'\n');
+        self.file.write_all(&record)?;
         self.file.sync_all()?;
-        if matches!(
-            event.status.as_str(),
-            "match_complete" | "skipped_forfeit" | "artifact_missing" | "artifact_unsupported"
-        ) {
+        if is_terminal_status(&event.status) {
             self.completed
                 .insert((event.season, event.mode, event.match_id));
         }
@@ -415,13 +455,18 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
     Ok(rows)
 }
 
-fn validate_b2_url(raw: &str) -> Result<Url> {
+fn validate_archive_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).context("invalid demo_url")?;
+    let host = url.host_str();
+    let backblaze = host == Some(B2_HOST) && url.path().starts_with(B2_PATH_PREFIX);
+    let legacy_digital_ocean = host.is_some_and(|value| LEGACY_DO_HOSTS.contains(&value));
     if url.scheme() != "https"
-        || url.host_str() != Some(B2_HOST)
-        || !url.path().starts_with(B2_PATH_PREFIX)
+        || (!backblaze && !legacy_digital_ocean)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
     {
-        bail!("demo_url is not an allowlisted Backblaze archive URL");
+        bail!("demo_url is not an allowlisted CSC archive URL");
     }
     if !(url.path().to_ascii_lowercase().ends_with(".7z")
         || url.path().to_ascii_lowercase().ends_with(".zip"))
@@ -776,7 +821,7 @@ async fn process_match(
         ))?;
         return Ok(());
     };
-    let url = match validate_b2_url(raw_url) {
+    let url = match validate_archive_url(raw_url) {
         Ok(url) => url,
         Err(error) => {
             verify_reviewed_terminal(
@@ -895,6 +940,8 @@ async fn process_match(
         .iter()
         .map(|item| item.candidate.stats_match_id.clone())
         .collect();
+    let mut ordered_targets = targets.iter().cloned().collect::<Vec<_>>();
+    ordered_targets.sort();
     if let Some(reviewed) = reviewed_inventory {
         let current = validations
             .iter()
@@ -908,25 +955,84 @@ async fn process_match(
                 )
             })
             .collect::<HashSet<_>>();
-        if reviewed.ready_sets.get(&core_match.match_id) != Some(&current) {
+        let reviewed_ready = reviewed
+            .ready_sets
+            .get(&core_match.match_id)
+            .cloned()
+            .unwrap_or_default();
+        if reviewed_ready != current {
             bail!("current ready candidate set differs from reviewed inventory");
         }
     }
-    for target in &targets {
+    let mut skipped_targets = Vec::new();
+    for target in &ordered_targets {
         match ready_by_target.get(target).map(Vec::len).unwrap_or(0) {
             1 => {}
-            0 => bail!("no demo candidate uniquely fingerprints Stats map {target}"),
+            0 => {
+                let candidates = validations
+                    .iter()
+                    .filter(|item| item.candidate.stats_match_id == *target)
+                    .collect::<Vec<_>>();
+                let mut classifications = candidates
+                    .iter()
+                    .filter_map(|item| {
+                        item.response
+                            .get("classification")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                classifications.sort();
+                classifications.dedup();
+                if candidates.is_empty()
+                    || !candidates.iter().all(|item| {
+                        is_clean_non_repairable(
+                            item.response.get("classification").and_then(Value::as_str),
+                        )
+                    })
+                {
+                    bail!("Stats map {target} has no ready or clean non-repairable verdict");
+                }
+                skipped_targets.push(json!({
+                    "statsMatchId": target,
+                    "classifications": classifications,
+                }));
+            }
             count => {
                 bail!("{count} demos fingerprint the same Stats map {target}; source is ambiguous")
             }
         }
     }
 
+    if ready_by_target.is_empty() {
+        verify_reviewed_terminal(
+            reviewed_inventory,
+            core_match.match_id,
+            "skipped_not_repairable",
+        )?;
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "skipped_not_repairable",
+            None,
+            Some("all discovered maps received clean non-repairable verdicts".to_owned()),
+            Some(json!({
+                "archiveChecksum": archive_checksum,
+                "targets": skipped_targets,
+            })),
+        ))?;
+        if !args.keep_successful {
+            remove_successful_workspace(args, &match_workspace)?;
+        }
+        return Ok(());
+    }
+
     if args.apply {
-        let mut ordered_targets = targets.iter().collect::<Vec<_>>();
-        ordered_targets.sort();
-        for target in ordered_targets {
-            let validation = ready_by_target[target][0];
+        for target in &ordered_targets {
+            let Some(validations) = ready_by_target.get(target) else {
+                continue;
+            };
+            let validation = validations[0];
             let reviewed = reviewed_inventory
                 .and_then(|inventory| {
                     inventory.ready.get(&(
@@ -994,11 +1100,15 @@ async fn process_match(
         "match_complete",
         None,
         Some(format!(
-            "{} unique map candidate(s) {}",
-            targets.len(),
-            if args.apply { "repaired" } else { "validated" }
+            "{} unique map candidate(s) {}; {} map(s) skipped as not repairable",
+            ready_by_target.len(),
+            if args.apply { "repaired" } else { "validated" },
+            skipped_targets.len()
         )),
-        Some(json!({ "archiveChecksum": archive_checksum })),
+        Some(json!({
+            "archiveChecksum": archive_checksum,
+            "skippedTargets": skipped_targets,
+        })),
     ))?;
     if !args.keep_successful {
         remove_successful_workspace(args, &match_workspace)?;
@@ -1042,7 +1152,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30 * 60))
-        // Backblaze archive URLs and the internal Stats endpoint are direct.
+        // Allowlisted archive URLs and the internal Stats endpoint are direct.
         // Refusing redirects prevents a trusted URL from redirecting a repair
         // run to an unreviewed host.
         .redirect(reqwest::redirect::Policy::none())
@@ -1062,7 +1172,12 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         );
     }
     if let Some(inventory) = &reviewed_inventory {
-        let missing_review = available
+        let required_review = if selected.is_empty() {
+            &available
+        } else {
+            &selected
+        };
+        let missing_review = required_review
             .difference(&inventory.terminal_matches)
             .copied()
             .collect::<Vec<_>>();
@@ -1141,6 +1256,31 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "stats-importer-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn ledger_event(status: &str) -> LedgerEvent {
+        LedgerEvent {
+            schema_version: 1,
+            timestamp_unix: 1,
+            season: 18,
+            mode: "dry-run".to_owned(),
+            match_id: 123,
+            status: status.to_owned(),
+            stats_match_id: None,
+            message: None,
+            evidence: None,
+        }
+    }
+
     fn core_match(id: i64, is_bo3: bool) -> CoreMatch {
         CoreMatch {
             match_id: id,
@@ -1159,6 +1299,33 @@ mod tests {
         assert!(safe_member_path("demo/nested/match.dem"));
         assert!(!safe_member_path("../match.dem"));
         assert!(!safe_member_path("/tmp/match.dem"));
+    }
+
+    #[test]
+    fn archive_url_allowlist_covers_backblaze_and_legacy_csc_spaces_only() {
+        assert!(validate_archive_url(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s18/M01/match.7z"
+        )
+        .is_ok());
+        assert!(validate_archive_url(
+            "https://cscdemos.nyc3.digitaloceanspaces.com/s20/M01/match.7z"
+        )
+        .is_ok());
+        assert!(validate_archive_url(
+            "https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s20/M01/match.zip"
+        )
+        .is_ok());
+        assert!(
+            validate_archive_url("https://attacker.nyc3.digitaloceanspaces.com/match.7z").is_err()
+        );
+        assert!(validate_archive_url(
+            "https://f005.backblazeb2.com.attacker.example/file/csc-demo-archive/match.7z"
+        )
+        .is_err());
+        assert!(validate_archive_url(
+            "https://user@f005.backblazeb2.com/file/csc-demo-archive/match.7z"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1192,5 +1359,68 @@ mod tests {
         let found = discover_demos(&root, &core_match(456, false)).unwrap();
         assert_eq!(found[0].stats_match_id, "456");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_non_repairable_verdicts_are_explicit() {
+        for classification in [
+            "ingest_incomplete",
+            "no_matching_candidate",
+            "fingerprint_mismatch",
+            "ambiguous",
+        ] {
+            assert!(is_clean_non_repairable(Some(classification)));
+        }
+        assert!(!is_clean_non_repairable(Some("parse_failed")));
+        assert!(!is_clean_non_repairable(Some("ready")));
+        assert!(!is_clean_non_repairable(None));
+    }
+
+    #[test]
+    fn ledger_discards_only_an_incomplete_trailing_record() {
+        let path = test_path("trailing-ledger");
+        {
+            let mut ledger = Ledger::open(path.clone()).unwrap();
+            ledger
+                .append(ledger_event("skipped_not_repairable"))
+                .unwrap();
+        }
+        let valid_len = fs::metadata(&path).unwrap().len();
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(br#"{"schema_version":1,"timestamp_unix"#)
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+        let ledger = Ledger::open(path.clone()).unwrap();
+        assert!(ledger.is_complete(18, "dry-run", 123));
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+        drop(ledger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ledger_preserves_a_complete_record_missing_only_its_newline() {
+        let path = test_path("missing-newline-ledger");
+        fs::write(
+            &path,
+            serde_json::to_vec(&ledger_event("match_complete")).unwrap(),
+        )
+        .unwrap();
+        let ledger = Ledger::open(path.clone()).unwrap();
+        assert!(ledger.is_complete(18, "dry-run", 123));
+        assert!(fs::read(&path).unwrap().ends_with(b"\n"));
+        drop(ledger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ledger_rejects_newline_terminated_corruption() {
+        let path = test_path("interior-corrupt-ledger");
+        let mut bytes = serde_json::to_vec(&ledger_event("match_complete")).unwrap();
+        bytes.extend_from_slice(b"\n{not-json}\n");
+        fs::write(&path, bytes).unwrap();
+        assert!(Ledger::open(path.clone()).is_err());
+        fs::remove_file(path).unwrap();
     }
 }
