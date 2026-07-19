@@ -32,10 +32,10 @@ Demos that were skipped/errored will be placed in `_skipped`, to reprocess just 
 The `backfill` command inventories one Core season at a time, skips explicit
 forfeits and legacy 1-0/0-1 forfeits, downloads each match's public Backblaze
 archive (or its exact legacy CSC DigitalOcean/CSC CDN location), validates it
-with `7z`, recursively discovers demos (including old
-`demo/` and `demos/` layouts), and asks CSC-Stats to fingerprint every demo.
-It is dry-run only unless `--apply` and a matching `--confirm-season` are both
-provided.
+with `7z`, recursively discovers demos (including old `demo/` and `demos/`
+layouts), and asks CSC-Stats to fingerprint every demo. A historical BO3 archive
+is processed as one match-sized unit. It is dry-run only unless `--apply` and a
+matching `--confirm-season` are both provided.
 
 The Stats endpoint performs the mutation: it locks one exact Stats map,
 rechecks reviewed demo/current-data hashes, and transactionally replaces only
@@ -105,11 +105,17 @@ scripts/run-backfill-nice.sh \
 ```
 
 Every status transition is appended and fsynced to a JSONL ledger under the
-workspace. Completed matches resume without replay; failures retain their
-isolated workspace. A process kill during the final ledger append discards only
-the incomplete trailing record on resume; newline-terminated/interior corruption
-still fails closed. Clean endpoint verdicts that cannot be repaired
+workspace. Completed matches resume without replay. Extracted demos are deleted
+with their archive when that match finishes, and the whole per-attempt workspace
+is also deleted after a failure. `--keep-successful` is the only option that
+retains a completed match's archive and extracted demos. Peak working disk is
+therefore bounded to one compressed match archive plus that archive's extracted
+contents and the small ledger, subject to the configured size limits. A process
+kill during the final ledger append discards only the incomplete trailing record
+on resume; newline-terminated/interior corruption still fails closed.
+Clean endpoint verdicts that cannot be repaired
 (`ingest_incomplete`, `no_matching_candidate`, `fingerprint_mismatch`, and
 `ambiguous`) are recorded as terminal `skipped_not_repairable` results, while a
-mixed BO3 still repairs its uniquely validated maps. The runner is strictly
-sequential and pauses five seconds between matches by default.
+mixed BO3 still repairs its uniquely validated maps. The Core-match loop is
+strictly sequential, with no task spawning or buffered concurrency, and the
+runner pauses five seconds between matches by default.

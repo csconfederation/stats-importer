@@ -11,6 +11,6 @@ if [[ ! -x "${binary}" ]]; then
 fi
 
 # niceness 15 plus idle-class disk I/O keeps the coordinator and its 7z child
-# low priority. The backfill itself is also strictly sequential and pauses
-# between matches, which limits load on the remote parser and databases.
+# low priority. The backfill keeps only one match/BO3 workspace at a time and
+# pauses between matches.
 exec nice -n "${STATS_REPAIR_NICE:-15}" ionice -c 3 "${binary}" backfill "$@"

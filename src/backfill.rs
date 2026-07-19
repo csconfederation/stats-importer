@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -134,6 +134,46 @@ struct DemoCandidate {
 struct Validation {
     candidate: DemoCandidate,
     response: Value,
+}
+
+struct AttemptWorkspace {
+    root: PathBuf,
+    path: PathBuf,
+    retained: bool,
+}
+
+impl AttemptWorkspace {
+    fn new(root: &Path, path: PathBuf) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            path,
+            retained: false,
+        }
+    }
+
+    fn finish(&mut self, retain: bool) -> Result<()> {
+        if retain {
+            self.retained = true;
+            return Ok(());
+        }
+        remove_isolated_directory(&self.root, &self.path)?;
+        self.retained = true;
+        Ok(())
+    }
+}
+
+impl Drop for AttemptWorkspace {
+    fn drop(&mut self) {
+        if self.retained || !self.path.exists() {
+            return;
+        }
+        if let Err(error) = remove_isolated_directory(&self.root, &self.path) {
+            eprintln!(
+                "failed to clean attempt workspace {}: {error:#}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 struct ReviewedInventory {
@@ -776,16 +816,35 @@ async fn repair_request(
     Ok(value)
 }
 
-fn remove_successful_workspace(args: &BackfillArgs, path: &Path) -> Result<()> {
-    let canonical_parent = fs::canonicalize(
-        path.parent()
-            .ok_or_else(|| anyhow!("invalid match workspace"))?,
-    )?;
-    let canonical_root = fs::canonicalize(&args.workspace)?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        bail!("refusing to remove workspace outside configured root");
+fn remove_isolated_directory(root: &Path, path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
     }
-    fs::remove_dir_all(path)?;
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_path = fs::canonicalize(path)?;
+    if canonical_path == canonical_root || !canonical_path.starts_with(&canonical_root) {
+        bail!("refusing to remove directory outside configured root");
+    }
+    fs::remove_dir_all(&canonical_path)?;
+    let mut parent = canonical_path.parent().map(Path::to_path_buf);
+    while let Some(candidate) = parent {
+        if candidate == canonical_root {
+            break;
+        }
+        parent = candidate.parent().map(Path::to_path_buf);
+        match fs::remove_dir(&candidate) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
@@ -852,6 +911,7 @@ async fn process_match(
     );
     let match_workspace = match_root.join(attempt_name);
     fs::create_dir(&match_workspace)?;
+    let mut attempt_workspace = AttemptWorkspace::new(&args.workspace, match_workspace.clone());
     let extension = if url.path().to_ascii_lowercase().ends_with(".zip") {
         "zip"
     } else {
@@ -1021,9 +1081,7 @@ async fn process_match(
                 "targets": skipped_targets,
             })),
         ))?;
-        if !args.keep_successful {
-            remove_successful_workspace(args, &match_workspace)?;
-        }
+        attempt_workspace.finish(args.keep_successful)?;
         return Ok(());
     }
 
@@ -1110,9 +1168,7 @@ async fn process_match(
             "skippedTargets": skipped_targets,
         })),
     ))?;
-    if !args.keep_successful {
-        remove_successful_workspace(args, &match_workspace)?;
-    }
+    attempt_workspace.finish(args.keep_successful)?;
     Ok(())
 }
 
@@ -1244,10 +1300,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         args.season, processed, failures
     );
     if failures > 0 {
-        bail!(
-            "{} match(es) failed; see the JSONL ledger and retained workspaces",
-            failures
-        );
+        bail!("{} match(es) failed; see the JSONL ledger", failures);
     }
     Ok(())
 }
@@ -1358,6 +1411,36 @@ mod tests {
         fs::write(root.join("s11-mid456-7_map.dem"), b"demo").unwrap();
         let found = discover_demos(&root, &core_match(456, false)).unwrap();
         assert_eq!(found[0].stats_match_id, "456");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attempt_workspace_is_deleted_on_drop_and_empty_parents_are_pruned() {
+        let root = test_path("attempt-cleanup");
+        let attempt = root.join("s18/123/attempt-1");
+        fs::create_dir_all(attempt.join("extracted")).unwrap();
+        fs::write(attempt.join("archive.7z"), b"archive").unwrap();
+        fs::write(attempt.join("extracted/match.dem"), b"demo").unwrap();
+        {
+            let _workspace = AttemptWorkspace::new(&root, attempt.clone());
+        }
+        assert!(!attempt.exists());
+        assert!(!root.join("s18/123").exists());
+        assert!(root.exists());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn successful_workspace_is_retained_only_when_explicitly_requested() {
+        let root = test_path("attempt-retain");
+        let attempt = root.join("s18/123/attempt-1");
+        fs::create_dir_all(&attempt).unwrap();
+        fs::write(attempt.join("archive.7z"), b"archive").unwrap();
+        {
+            let mut workspace = AttemptWorkspace::new(&root, attempt.clone());
+            workspace.finish(true).unwrap();
+        }
+        assert!(attempt.join("archive.7z").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 
