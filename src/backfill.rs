@@ -79,8 +79,12 @@ pub struct BackfillArgs {
     match_id: Vec<i64>,
 
     /// Keep successful per-match workspaces instead of deleting them.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "keep_all")]
     keep_successful: bool,
+
+    /// Keep every per-match workspace, including failed attempts.
+    #[arg(long, conflicts_with = "keep_successful")]
+    keep_all: bool,
 
     /// Maximum archive download size in GiB.
     #[arg(long, default_value_t = 8)]
@@ -101,6 +105,9 @@ struct CoreMatch {
     is_bo3: bool,
     demo_url: Option<String>,
     map_count: i64,
+    played_map_numbers: Vec<i32>,
+    match_day: String,
+    tier: Option<String>,
     marked_forfeit: bool,
     legacy_one_zero: bool,
     has_forfeit_audit: bool,
@@ -128,6 +135,7 @@ struct DemoCandidate {
     relative_path: String,
     stats_match_id: String,
     checksum: String,
+    identity_source: String,
 }
 
 #[derive(Debug)]
@@ -140,14 +148,16 @@ struct AttemptWorkspace {
     root: PathBuf,
     path: PathBuf,
     retained: bool,
+    retain_on_drop: bool,
 }
 
 impl AttemptWorkspace {
-    fn new(root: &Path, path: PathBuf) -> Self {
+    fn new(root: &Path, path: PathBuf, retain_on_drop: bool) -> Self {
         Self {
             root: root.to_path_buf(),
             path,
             retained: false,
+            retain_on_drop,
         }
     }
 
@@ -164,7 +174,7 @@ impl AttemptWorkspace {
 
 impl Drop for AttemptWorkspace {
     fn drop(&mut self) {
-        if self.retained || !self.path.exists() {
+        if self.retained || self.retain_on_drop || !self.path.exists() {
             return;
         }
         if let Err(error) = remove_isolated_directory(&self.root, &self.path) {
@@ -182,6 +192,8 @@ struct ReviewedInventory {
     terminal_matches: HashSet<i64>,
     terminal_status: HashMap<i64, String>,
     ready_sets: HashMap<i64, HashSet<(String, String)>>,
+    importable: HashMap<(i64, String, String), Value>,
+    importable_sets: HashMap<i64, HashSet<(String, String)>>,
     archive_checksums: HashMap<i64, String>,
 }
 
@@ -208,6 +220,8 @@ impl ReviewedInventory {
         let mut terminal_matches = HashSet::new();
         let mut terminal_status = HashMap::new();
         let mut ready_sets: HashMap<i64, HashSet<(String, String)>> = HashMap::new();
+        let mut importable = HashMap::new();
+        let mut importable_sets: HashMap<i64, HashSet<(String, String)>> = HashMap::new();
         let mut archive_checksums = HashMap::new();
         for (line_number, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
@@ -260,6 +274,14 @@ impl ReviewedInventory {
                         .or_default()
                         .insert((stats_match_id.clone(), demo_checksum.clone()));
                     ready.insert((event.match_id, stats_match_id, demo_checksum), result);
+                } else if result.get("classification").and_then(Value::as_str)
+                    == Some("no_matching_candidate")
+                {
+                    importable_sets
+                        .entry(event.match_id)
+                        .or_default()
+                        .insert((stats_match_id.clone(), demo_checksum.clone()));
+                    importable.insert((event.match_id, stats_match_id, demo_checksum), result);
                 }
             }
         }
@@ -269,6 +291,8 @@ impl ReviewedInventory {
             terminal_matches,
             terminal_status,
             ready_sets,
+            importable,
+            importable_sets,
             archive_checksums,
         }))
     }
@@ -283,6 +307,10 @@ fn verify_reviewed_terminal(
         if inventory.terminal_status.get(&match_id).map(String::as_str) != Some(status)
             || inventory
                 .ready_sets
+                .get(&match_id)
+                .is_some_and(|set| !set.is_empty())
+            || inventory
+                .importable_sets
                 .get(&match_id)
                 .is_some_and(|set| !set.is_empty())
         {
@@ -311,7 +339,7 @@ fn is_terminal_status(status: &str) -> bool {
 fn is_clean_non_repairable(classification: Option<&str>) -> bool {
     matches!(
         classification,
-        Some("ingest_incomplete" | "no_matching_candidate" | "fingerprint_mismatch" | "ambiguous")
+        Some("ingest_incomplete" | "fingerprint_mismatch" | "ambiguous")
     )
 }
 
@@ -465,7 +493,8 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                    (ms.home_score = 0 AND ms.away_score = 1) OR
                    regexp_replace(coalesce(ms.score, ''), '\s+', '', 'g') IN ('1-0', '0-1')
                  ) AS legacy_one_zero,
-                 count(*)::bigint AS map_count
+                 count(*)::bigint AS map_count,
+                 array_agg(ms.map_number ORDER BY ms.map_number) AS played_map_numbers
           FROM matches_matchstats ms
           GROUP BY ms.match_id
         ), audit_flags AS (
@@ -477,12 +506,19 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                m.is_bo3,
                m.demo_url,
                coalesce(sf.map_count, 0)::bigint AS map_count,
+               coalesce(sf.played_map_numbers, ARRAY[]::integer[]) AS played_map_numbers,
+               md.number::text AS match_day,
+               coalesce(home_tier.name, away_tier.name) AS tier,
                coalesce(sf.marked_forfeit, false) AS marked_forfeit,
                coalesce(sf.legacy_one_zero, false) AS legacy_one_zero,
                coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit
         FROM matches_matches m
         JOIN leagues_matchday md ON md.id = m.match_day_id
         JOIN leagues_seasons s ON s.id = md.season_id
+        LEFT JOIN teams_teams home_team ON home_team.id = m.home_id
+        LEFT JOIN players_tiers home_tier ON home_tier.id = home_team.tier_id
+        LEFT JOIN teams_teams away_team ON away_team.id = m.away_id
+        LEFT JOIN players_tiers away_tier ON away_tier.id = away_team.tier_id
         LEFT JOIN stat_flags sf ON sf.match_id = m.id
         LEFT JOIN audit_flags af ON af.match_id = m.id
         WHERE s.number = $1
@@ -664,10 +700,44 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hash.finalize()))
 }
 
+fn reviewed_cached_archive(
+    match_root: &Path,
+    current_attempt: &Path,
+    extension: &str,
+    expected_checksum: Option<&str>,
+    expected_source_url: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    if expected_checksum.is_none() && expected_source_url.is_none() {
+        return Ok(None);
+    }
+    let expected_name = format!("archive.{extension}");
+    for entry in WalkDir::new(match_root).min_depth(2).max_depth(2) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry.file_name().to_string_lossy() != expected_name
+            || entry.path().starts_with(current_attempt)
+        {
+            continue;
+        }
+        let checksum_matches = expected_checksum
+            .map(|expected| sha256_file(entry.path()).map(|actual| actual == expected))
+            .transpose()?
+            .unwrap_or(false);
+        let source_url_matches = expected_source_url.is_some_and(|expected| {
+            fs::read_to_string(entry.path().with_file_name("source-url.txt"))
+                .is_ok_and(|actual| actual == expected)
+        });
+        if checksum_matches || source_url_matches {
+            return Ok(Some(entry.path().to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
 fn discover_demos(extracted: &Path, core_match: &CoreMatch) -> Result<Vec<DemoCandidate>> {
-    let suffix = Regex::new(&format!(r"-mid{}-([0-9]+)(?:_|-)", core_match.match_id))?;
-    let foreign_mid = Regex::new(r"-mid([0-9]+)-")?;
-    let mut demos = Vec::new();
+    let exact_suffix = Regex::new(&format!(r"-mid{}-([0-9]+)(?:_|-)", core_match.match_id))?;
+    let any_suffix = Regex::new(r"-mid[0-9]+-([0-9]+)(?:_|-)")?;
+    let mut paths = Vec::new();
     for entry in WalkDir::new(extracted)
         .follow_links(false)
         .sort_by_file_name()
@@ -684,43 +754,62 @@ fn discover_demos(extracted: &Path, core_match: &CoreMatch) -> Result<Vec<DemoCa
         if !extension.eq_ignore_ascii_case("dem") {
             continue;
         }
-        let filename = entry.file_name().to_string_lossy();
-        let embedded_id = foreign_mid
-            .captures(&filename)
+        paths.push(entry.path().to_path_buf());
+    }
+    if paths.is_empty() {
+        bail!("archive contains no .dem files (recursive search included demo/ and demos/)");
+    }
+
+    let mut demos = Vec::new();
+    for (index, path) in paths.into_iter().enumerate() {
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("demo filename is not UTF-8"))?;
+        let (stats_match_id, identity_source) = if !core_match.is_bo3 {
+            (core_match.match_id.to_string(), "core_bo1".to_owned())
+        } else if let Some(map_suffix) = exact_suffix
+            .captures(filename)
             .and_then(|captures| captures.get(1))
-            .ok_or_else(|| anyhow!("demo filename has no -mid<ID>- marker: {filename}"))?
-            .as_str()
-            .parse::<i64>()?;
-        if embedded_id != core_match.match_id {
-            bail!(
-                "archive for {} contains foreign match ID {}",
-                core_match.match_id,
-                embedded_id
-            );
-        }
-        let stats_match_id = if core_match.is_bo3 {
-            let map_suffix = suffix
-                .captures(&filename)
-                .and_then(|captures| captures.get(1))
-                .ok_or_else(|| anyhow!("BO3 demo filename has no map suffix: {filename}"))?
-                .as_str();
-            format!("{}_{}", core_match.match_id, map_suffix)
+        {
+            (
+                format!("{}_{}", core_match.match_id, map_suffix.as_str()),
+                "exact_filename".to_owned(),
+            )
+        } else if let Some(map_suffix) = any_suffix
+            .captures(filename)
+            .and_then(|captures| captures.get(1))
+        {
+            // The archive URL is attached to this exact Core match. Preserve
+            // the historical map suffix while replacing a stale/mistyped
+            // embedded match ID with the authoritative Core ID.
+            (
+                format!("{}_{}", core_match.match_id, map_suffix.as_str()),
+                "core_id_normalized".to_owned(),
+            )
         } else {
-            core_match.match_id.to_string()
+            let map_number = core_match
+                .played_map_numbers
+                .get(index)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cannot map unnamed BO3 demo {} to a Core map number",
+                        filename
+                    )
+                })?;
+            (
+                format!("{}_{}", core_match.match_id, map_number),
+                "core_map_order".to_owned(),
+            )
         };
         demos.push(DemoCandidate {
-            path: entry.path().to_path_buf(),
-            relative_path: entry
-                .path()
-                .strip_prefix(extracted)?
-                .to_string_lossy()
-                .to_string(),
+            checksum: sha256_file(&path)?,
+            relative_path: path.strip_prefix(extracted)?.to_string_lossy().to_string(),
+            path,
             stats_match_id,
-            checksum: sha256_file(entry.path())?,
+            identity_source,
         });
-    }
-    if demos.is_empty() {
-        bail!("archive contains no .dem files (recursive search included demo/ and demos/)");
     }
     Ok(demos)
 }
@@ -812,6 +901,46 @@ async fn repair_request(
         .context("Stats repair endpoint returned non-JSON")?;
     if !status.is_success() {
         bail!("Stats repair endpoint returned {status}: {value}");
+    }
+    Ok(value)
+}
+
+async fn full_import_request(
+    client: &Client,
+    args: &BackfillArgs,
+    token: &str,
+    core_match: &CoreMatch,
+    demo: &DemoCandidate,
+) -> Result<Value> {
+    let stats_url = env::var("STATS_API_URL").context("STATS_API_URL is required")?;
+    let tier = core_match
+        .tier
+        .as_deref()
+        .ok_or_else(|| anyhow!("Core match {} has no team tier", core_match.match_id))?;
+    let body = json!({
+        "path": api_path(args, &demo.path)?,
+        "matchId": demo.stats_match_id,
+        "matchDay": core_match.match_day,
+        "matchType": if core_match.is_bo3 { "Playoff" } else { "Regulation" },
+        "season": args.season,
+        "tier": tier,
+        "createOnly": true,
+        "fixCoreScores": false,
+        "fixTeamNames": false,
+    });
+    let response = client
+        .post(format!("{}/api/add-match", stats_url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .context("Stats full-import endpoint returned non-JSON")?;
+    if !status.is_success() {
+        bail!("Stats full-import endpoint returned {status}: {value}");
     }
     Ok(value)
 }
@@ -911,28 +1040,57 @@ async fn process_match(
     );
     let match_workspace = match_root.join(attempt_name);
     fs::create_dir(&match_workspace)?;
-    let mut attempt_workspace = AttemptWorkspace::new(&args.workspace, match_workspace.clone());
+    let mut attempt_workspace =
+        AttemptWorkspace::new(&args.workspace, match_workspace.clone(), args.keep_all);
     let extension = if url.path().to_ascii_lowercase().ends_with(".zip") {
         "zip"
     } else {
         "7z"
     };
-    let archive_path = match_workspace.join(format!("archive.{extension}"));
-    ledger.append(event(
-        args,
-        core_match.match_id,
-        "downloading",
-        None,
-        None,
-        None,
-    ))?;
-    let archive_checksum = download_archive(
-        client,
-        &url,
-        &archive_path,
-        args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
-    )
-    .await?;
+    let reviewed_archive_checksum = reviewed_inventory.and_then(|inventory| {
+        inventory
+            .archive_checksums
+            .get(&core_match.match_id)
+            .map(String::as_str)
+    });
+    let cached_archive = reviewed_cached_archive(
+        &match_root,
+        &match_workspace,
+        extension,
+        reviewed_archive_checksum,
+        args.keep_all.then_some(url.as_str()),
+    )?;
+    let (archive_path, archive_checksum) = if let Some(cached_archive) = cached_archive {
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "using_cached_archive",
+            None,
+            Some(cached_archive.to_string_lossy().to_string()),
+            Some(json!({ "archiveChecksum": reviewed_archive_checksum })),
+        ))?;
+        let checksum = sha256_file(&cached_archive)?;
+        (cached_archive, checksum)
+    } else {
+        let archive_path = match_workspace.join(format!("archive.{extension}"));
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "downloading",
+            None,
+            None,
+            None,
+        ))?;
+        let checksum = download_archive(
+            client,
+            &url,
+            &archive_path,
+            args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
+        )
+        .await?;
+        fs::write(archive_path.with_file_name("source-url.txt"), url.as_str())?;
+        (archive_path, checksum)
+    };
     if let Some(reviewed) = reviewed_inventory {
         if reviewed
             .archive_checksums
@@ -953,11 +1111,21 @@ async fn process_match(
     let demos = discover_demos(&extracted, core_match)?;
 
     if core_match.map_count > 0 && (demos.len() as i64) < core_match.map_count {
-        bail!(
-            "archive contains {} demos but Core records {} played maps",
-            demos.len(),
-            core_match.map_count
-        );
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "partial_archive",
+            None,
+            Some(format!(
+                "archive contains {} demos while Core records {} played maps; processing available demos",
+                demos.len(), core_match.map_count
+            )),
+            Some(json!({
+                "availableDemos": demos.len(),
+                "corePlayedMaps": core_match.map_count,
+                "coreMapNumbers": core_match.played_map_numbers,
+            })),
+        ))?;
     }
 
     let mut validations = Vec::new();
@@ -974,8 +1142,26 @@ async fn process_match(
             None,
         )
         .await?;
-        ledger.append(event(args, core_match.match_id, "demo_validated", Some(demo.stats_match_id.clone()), None,
-            Some(json!({ "demo": demo.relative_path, "demoChecksum": demo.checksum, "result": response }))))?;
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "demo_validated",
+            Some(demo.stats_match_id.clone()),
+            None,
+            Some(json!({
+                "demo": demo.relative_path,
+                "demoChecksum": demo.checksum,
+                "identitySource": demo.identity_source,
+                "coreMatch": {
+                    "matchId": core_match.match_id,
+                    "season": args.season,
+                    "matchDay": core_match.match_day,
+                    "tier": core_match.tier,
+                    "isBo3": core_match.is_bo3,
+                },
+                "result": response,
+            })),
+        ))?;
         validations.push(Validation {
             candidate: demo,
             response,
@@ -983,17 +1169,22 @@ async fn process_match(
     }
 
     let mut ready_by_target: HashMap<String, Vec<&Validation>> = HashMap::new();
+    let mut importable_by_target: HashMap<String, Vec<&Validation>> = HashMap::new();
     for validation in &validations {
-        if validation
+        let classification = validation
             .response
             .get("classification")
-            .and_then(Value::as_str)
-            == Some("ready")
-        {
-            ready_by_target
+            .and_then(Value::as_str);
+        match classification {
+            Some("ready") => ready_by_target
                 .entry(validation.candidate.stats_match_id.clone())
                 .or_default()
-                .push(validation);
+                .push(validation),
+            Some("no_matching_candidate") => importable_by_target
+                .entry(validation.candidate.stats_match_id.clone())
+                .or_default()
+                .push(validation),
+            _ => {}
         }
     }
     let targets: HashSet<_> = validations
@@ -1023,10 +1214,33 @@ async fn process_match(
         if reviewed_ready != current {
             bail!("current ready candidate set differs from reviewed inventory");
         }
+        let current_importable = validations
+            .iter()
+            .filter(|item| {
+                item.response.get("classification").and_then(Value::as_str)
+                    == Some("no_matching_candidate")
+            })
+            .map(|item| {
+                (
+                    item.candidate.stats_match_id.clone(),
+                    item.candidate.checksum.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let reviewed_importable = reviewed
+            .importable_sets
+            .get(&core_match.match_id)
+            .cloned()
+            .unwrap_or_default();
+        if reviewed_importable != current_importable {
+            bail!("current missing-match import set differs from reviewed inventory");
+        }
     }
     let mut skipped_targets = Vec::new();
     for target in &ordered_targets {
-        match ready_by_target.get(target).map(Vec::len).unwrap_or(0) {
+        let ready_count = ready_by_target.get(target).map(Vec::len).unwrap_or(0);
+        let import_count = importable_by_target.get(target).map(Vec::len).unwrap_or(0);
+        match ready_count + import_count {
             1 => {}
             0 => {
                 let candidates = validations
@@ -1064,7 +1278,7 @@ async fn process_match(
         }
     }
 
-    if ready_by_target.is_empty() {
+    if ready_by_target.is_empty() && importable_by_target.is_empty() {
         verify_reviewed_terminal(
             reviewed_inventory,
             core_match.match_id,
@@ -1081,7 +1295,7 @@ async fn process_match(
                 "targets": skipped_targets,
             })),
         ))?;
-        attempt_workspace.finish(args.keep_successful)?;
+        attempt_workspace.finish(args.keep_successful || args.keep_all)?;
         return Ok(());
     }
 
@@ -1150,6 +1364,37 @@ async fn process_match(
                 Some(response),
             ))?;
         }
+        for target in &ordered_targets {
+            let Some(validations) = importable_by_target.get(target) else {
+                continue;
+            };
+            let validation = validations[0];
+            if reviewed_inventory
+                .and_then(|inventory| {
+                    inventory.importable.get(&(
+                        core_match.match_id,
+                        validation.candidate.stats_match_id.clone(),
+                        validation.candidate.checksum.clone(),
+                    ))
+                })
+                .is_none()
+            {
+                bail!(
+                    "missing-match candidate {} is absent from the reviewed dry-run inventory",
+                    validation.candidate.stats_match_id,
+                );
+            }
+            let response =
+                full_import_request(client, args, token, core_match, &validation.candidate).await?;
+            ledger.append(event(
+                args,
+                core_match.match_id,
+                "demo_imported",
+                Some(validation.candidate.stats_match_id.clone()),
+                None,
+                Some(response),
+            ))?;
+        }
     }
 
     ledger.append(event(
@@ -1158,17 +1403,25 @@ async fn process_match(
         "match_complete",
         None,
         Some(format!(
-            "{} unique map candidate(s) {}; {} map(s) skipped as not repairable",
+            "{} repair candidate(s) {}, {} missing map(s) {}, {} map(s) skipped as not repairable",
             ready_by_target.len(),
             if args.apply { "repaired" } else { "validated" },
+            importable_by_target.len(),
+            if args.apply {
+                "imported"
+            } else {
+                "validated for create-only import"
+            },
             skipped_targets.len()
         )),
         Some(json!({
             "archiveChecksum": archive_checksum,
             "skippedTargets": skipped_targets,
+            "repairTargets": ready_by_target.keys().collect::<Vec<_>>(),
+            "importTargets": importable_by_target.keys().collect::<Vec<_>>(),
         })),
     ))?;
-    attempt_workspace.finish(args.keep_successful)?;
+    attempt_workspace.finish(args.keep_successful || args.keep_all)?;
     Ok(())
 }
 
@@ -1340,6 +1593,9 @@ mod tests {
             is_bo3,
             demo_url: None,
             map_count: 1,
+            played_map_numbers: vec![1],
+            match_day: "M01".to_owned(),
+            tier: Some("Elite".to_owned()),
             marked_forfeit: false,
             legacy_one_zero: false,
             has_forfeit_audit: false,
@@ -1415,6 +1671,93 @@ mod tests {
     }
 
     #[test]
+    fn bo3_normalizes_a_stale_embedded_match_id_from_core_metadata() {
+        let root = test_path("normalize-mid");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("s12-mid999-2_mirage.dem"), b"demo").unwrap();
+        let found = discover_demos(&root, &core_match(456, true)).unwrap();
+        assert_eq!(found[0].stats_match_id, "456_2");
+        assert_eq!(found[0].identity_source, "core_id_normalized");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bo3_uses_core_map_order_when_the_filename_has_no_identity() {
+        let root = test_path("normalize-unnamed");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("first.dem"), b"a").unwrap();
+        fs::write(root.join("second.dem"), b"b").unwrap();
+        let mut core = core_match(456, true);
+        core.played_map_numbers = vec![1, 3];
+        core.map_count = 2;
+        let found = discover_demos(&root, &core).unwrap();
+        assert_eq!(found[0].stats_match_id, "456_1");
+        assert_eq!(found[1].stats_match_id, "456_3");
+        assert!(found
+            .iter()
+            .all(|demo| demo.identity_source == "core_map_order"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reviewed_apply_reuses_only_an_exact_cached_archive() {
+        let root = test_path("cached-archive");
+        let old_attempt = root.join("attempt-old");
+        let current_attempt = root.join("attempt-current");
+        fs::create_dir_all(&old_attempt).unwrap();
+        fs::create_dir_all(&current_attempt).unwrap();
+        let archive = old_attempt.join("archive.7z");
+        fs::write(&archive, b"approved archive").unwrap();
+        let checksum = sha256_file(&archive).unwrap();
+
+        assert_eq!(
+            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&checksum), None).unwrap(),
+            Some(archive)
+        );
+        assert!(reviewed_cached_archive(
+            &root,
+            &current_attempt,
+            "7z",
+            Some(&"0".repeat(64)),
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            reviewed_cached_archive(&root, &current_attempt, "7z", None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(
+            old_attempt.join("source-url.txt"),
+            "https://example.invalid/archive.7z",
+        )
+        .unwrap();
+        assert_eq!(
+            reviewed_cached_archive(
+                &root,
+                &current_attempt,
+                "7z",
+                None,
+                Some("https://example.invalid/archive.7z"),
+            )
+            .unwrap(),
+            Some(old_attempt.join("archive.7z"))
+        );
+        assert!(reviewed_cached_archive(
+            &root,
+            &current_attempt,
+            "7z",
+            None,
+            Some("https://example.invalid/different.7z"),
+        )
+        .unwrap()
+        .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn attempt_workspace_is_deleted_on_drop_and_empty_parents_are_pruned() {
         let root = test_path("attempt-cleanup");
         let attempt = root.join("s18/123/attempt-1");
@@ -1422,7 +1765,7 @@ mod tests {
         fs::write(attempt.join("archive.7z"), b"archive").unwrap();
         fs::write(attempt.join("extracted/match.dem"), b"demo").unwrap();
         {
-            let _workspace = AttemptWorkspace::new(&root, attempt.clone());
+            let _workspace = AttemptWorkspace::new(&root, attempt.clone(), false);
         }
         assert!(!attempt.exists());
         assert!(!root.join("s18/123").exists());
@@ -1437,7 +1780,7 @@ mod tests {
         fs::create_dir_all(&attempt).unwrap();
         fs::write(attempt.join("archive.7z"), b"archive").unwrap();
         {
-            let mut workspace = AttemptWorkspace::new(&root, attempt.clone());
+            let mut workspace = AttemptWorkspace::new(&root, attempt.clone(), false);
             workspace.finish(true).unwrap();
         }
         assert!(attempt.join("archive.7z").is_file());
@@ -1445,16 +1788,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_workspace_is_retained_when_keep_all_is_requested() {
+        let root = test_path("attempt-retain-all");
+        let attempt = root.join("s18/123/attempt-1");
+        fs::create_dir_all(&attempt).unwrap();
+        fs::write(attempt.join("archive.7z"), b"archive").unwrap();
+        {
+            let _workspace = AttemptWorkspace::new(&root, attempt.clone(), true);
+        }
+        assert!(attempt.join("archive.7z").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn clean_non_repairable_verdicts_are_explicit() {
-        for classification in [
-            "ingest_incomplete",
-            "no_matching_candidate",
-            "fingerprint_mismatch",
-            "ambiguous",
-        ] {
+        for classification in ["ingest_incomplete", "fingerprint_mismatch", "ambiguous"] {
             assert!(is_clean_non_repairable(Some(classification)));
         }
         assert!(!is_clean_non_repairable(Some("parse_failed")));
+        assert!(!is_clean_non_repairable(Some("no_matching_candidate")));
         assert!(!is_clean_non_repairable(Some("ready")));
         assert!(!is_clean_non_repairable(None));
     }
