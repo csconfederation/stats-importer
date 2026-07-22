@@ -101,6 +101,25 @@ can reuse a retained archive only when its SHA-256 matches that match's checksum
 in the approved dry-run ledger. Unreviewed dry runs download Core's current URL
 again because an object may have been replaced without changing its URL.
 
+A later dry run (for example, against production after a development inventory)
+may reuse retained archives without weakening review by supplying the immutable
+source ledger and its digest:
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 12 \
+  --cached-source-ledger /mnt/cs2-demos/round-repair-work/season-12-recovery-dry-run-v2.jsonl \
+  --cached-source-ledger-sha256 '<sha256-from-the-source-review>' \
+  --workspace /mnt/cs2-demos/round-repair-work \
+  --api-path-root /round-repair-work \
+  --parser-version 'worker-vX-demoScrape-vY@sha256:image-digest'
+```
+
+This option is dry-run-only. It reuses a file only when its SHA-256 equals the
+per-match `archiveChecksum` in the source ledger, then reparses it and evaluates
+the current database normally. Matches without a reviewed archive checksum are
+downloaded from Core's current URL.
+
 After the dry run completes with no failures, freeze its ledger and record its
 digest. Apply refuses to run without this exact dry-run inventory (complete for
 the full season, or complete for every explicitly selected `--match-id`) and
