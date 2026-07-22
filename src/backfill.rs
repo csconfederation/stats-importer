@@ -66,6 +66,18 @@ pub struct BackfillArgs {
     #[arg(long, requires = "apply")]
     reviewed_ledger_sha256: Option<String>,
 
+    /// Prior dry-run ledger used only to checksum-verify retained source archives.
+    #[arg(
+        long,
+        requires = "cached_source_ledger_sha256",
+        conflicts_with = "apply"
+    )]
+    cached_source_ledger: Option<PathBuf>,
+
+    /// SHA-256 of --cached-source-ledger.
+    #[arg(long, requires = "cached_source_ledger", conflicts_with = "apply")]
+    cached_source_ledger_sha256: Option<String>,
+
     /// Seconds to pause after each Core match (default 5).
     #[arg(long, default_value_t = 5)]
     pause_seconds: u64,
@@ -113,7 +125,7 @@ struct CoreMatch {
     has_forfeit_audit: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedgerEvent {
     schema_version: u8,
     timestamp_unix: u64,
@@ -196,6 +208,75 @@ struct ReviewedInventory {
     importable: HashMap<(i64, String, String), Value>,
     importable_sets: HashMap<i64, HashSet<(String, String)>>,
     archive_checksums: HashMap<i64, String>,
+}
+
+#[derive(Debug)]
+struct CachedSourceInventory {
+    checksum: String,
+    archive_checksums: HashMap<i64, String>,
+}
+
+impl CachedSourceInventory {
+    fn load(args: &BackfillArgs) -> Result<Option<Self>> {
+        let Some(path) = &args.cached_source_ledger else {
+            return Ok(None);
+        };
+        let expected = args.cached_source_ledger_sha256.as_deref().ok_or_else(|| {
+            anyhow!("--cached-source-ledger requires --cached-source-ledger-sha256")
+        })?;
+        let bytes = fs::read(path)?;
+        let checksum = hex::encode(Sha256::digest(&bytes));
+        if checksum != expected {
+            bail!("cached source ledger SHA-256 mismatch");
+        }
+        let content = String::from_utf8(bytes).context("cached source ledger is not UTF-8")?;
+        let mut archive_checksums = HashMap::new();
+        for (line_number, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: LedgerEvent = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "invalid cached source ledger JSON at line {}",
+                    line_number + 1
+                )
+            })?;
+            if event.schema_version != 1 || event.season != args.season || event.mode != "dry-run" {
+                bail!(
+                    "cached source ledger line {} is not this season's schema-v1 dry run",
+                    line_number + 1
+                );
+            }
+            if matches!(
+                event.status.as_str(),
+                "archive_cached"
+                    | "using_cached_archive"
+                    | "match_complete"
+                    | "skipped_not_repairable"
+            ) {
+                if let Some(value) = event
+                    .evidence
+                    .as_ref()
+                    .and_then(|item| item.get("archiveChecksum"))
+                    .and_then(Value::as_str)
+                {
+                    if archive_checksums
+                        .insert(event.match_id, value.to_owned())
+                        .is_some_and(|previous| previous != value)
+                    {
+                        bail!(
+                            "cached source ledger has conflicting archive checksums for match {}",
+                            event.match_id
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Some(Self {
+            checksum,
+            archive_checksums,
+        }))
+    }
 }
 
 impl ReviewedInventory {
@@ -726,7 +807,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hash.finalize()))
 }
 
-fn reviewed_cached_archive(
+fn checksum_matched_cached_archive(
     match_root: &Path,
     current_attempt: &Path,
     extension: &str,
@@ -1059,6 +1140,7 @@ async fn process_match(
     core_match: &CoreMatch,
     season_match_ids: &HashSet<i64>,
     reviewed_inventory: Option<&ReviewedInventory>,
+    cached_source_inventory: Option<&CachedSourceInventory>,
 ) -> Result<()> {
     if core_match.marked_forfeit || core_match.legacy_one_zero || core_match.has_forfeit_audit {
         verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
@@ -1122,27 +1204,44 @@ async fn process_match(
     } else {
         "7z"
     };
-    let reviewed_archive_checksum = reviewed_inventory.and_then(|inventory| {
-        inventory
-            .archive_checksums
-            .get(&core_match.match_id)
-            .map(String::as_str)
-    });
-    let cached_archive = reviewed_cached_archive(
+    let expected_archive_checksum = reviewed_inventory
+        .and_then(|inventory| {
+            inventory
+                .archive_checksums
+                .get(&core_match.match_id)
+                .map(String::as_str)
+        })
+        .or_else(|| {
+            cached_source_inventory.and_then(|inventory| {
+                inventory
+                    .archive_checksums
+                    .get(&core_match.match_id)
+                    .map(String::as_str)
+            })
+        });
+    let cached_archive = checksum_matched_cached_archive(
         &match_root,
         &match_workspace,
         extension,
-        reviewed_archive_checksum,
+        expected_archive_checksum,
     )?;
     let (archive_path, archive_checksum) = if let Some(cached_archive) = cached_archive {
         let checksum = sha256_file(&cached_archive)?;
+        let evidence = if let Some(source) = cached_source_inventory {
+            json!({
+                "archiveChecksum": checksum,
+                "sourceInventoryChecksum": source.checksum,
+            })
+        } else {
+            json!({ "archiveChecksum": checksum })
+        };
         ledger.append(event(
             args,
             core_match.match_id,
             "using_cached_archive",
             None,
             Some(cached_archive.to_string_lossy().to_string()),
-            Some(json!({ "archiveChecksum": checksum })),
+            Some(evidence),
         ))?;
         (cached_archive, checksum)
     } else {
@@ -1162,6 +1261,17 @@ async fn process_match(
             args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
         )
         .await?;
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "archive_cached",
+            None,
+            Some(archive_path.to_string_lossy().to_string()),
+            Some(json!({
+                "archiveChecksum": checksum,
+                "objectKey": url.path(),
+            })),
+        ))?;
         (archive_path, checksum)
     };
     if let Some(reviewed) = reviewed_inventory {
@@ -1507,6 +1617,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         bail!("--apply requires --confirm-season {}", args.season);
     }
     let reviewed_inventory = ReviewedInventory::load(&args)?;
+    let cached_source_inventory = CachedSourceInventory::load(&args)?;
     if args.max_archive_gib == 0 || args.max_extracted_gib == 0 || args.max_archive_members == 0 {
         bail!("archive size/member limits must be positive");
     }
@@ -1526,6 +1637,11 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     if let Some(reviewed_path) = &args.reviewed_ledger {
         if fs::canonicalize(reviewed_path)? == canonical_output_path(&ledger_path)? {
             bail!("--ledger must not overwrite the immutable --reviewed-ledger");
+        }
+    }
+    if let Some(source_path) = &args.cached_source_ledger {
+        if fs::canonicalize(source_path)? == canonical_output_path(&ledger_path)? {
+            bail!("--ledger must not overwrite the immutable --cached-source-ledger");
         }
     }
     let mut ledger = Ledger::open(ledger_path)?;
@@ -1606,6 +1722,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             &core_match,
             &available,
             reviewed_inventory.as_ref(),
+            cached_source_inventory.as_ref(),
         )
         .await
         {
@@ -1675,6 +1792,91 @@ mod tests {
             legacy_one_zero: false,
             has_forfeit_audit: false,
         }
+    }
+
+    fn backfill_args(workspace: &Path) -> BackfillArgs {
+        BackfillArgs {
+            season: 18,
+            apply: false,
+            confirm_season: None,
+            parser_version: "test-parser".to_owned(),
+            workspace: workspace.to_path_buf(),
+            api_path_root: workspace.to_path_buf(),
+            ledger: None,
+            reviewed_ledger: None,
+            reviewed_ledger_sha256: None,
+            cached_source_ledger: None,
+            cached_source_ledger_sha256: None,
+            pause_seconds: 0,
+            limit: None,
+            match_id: Vec::new(),
+            keep_successful: false,
+            keep_all: false,
+            max_archive_gib: 8,
+            max_extracted_gib: 32,
+            max_archive_members: 100,
+        }
+    }
+
+    #[test]
+    fn cached_source_inventory_requires_the_ledger_digest_and_consistent_checksums() {
+        let root = test_path("cached-source-inventory");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.jsonl");
+        let mut complete = ledger_event("match_complete");
+        complete.evidence = Some(json!({ "archiveChecksum": "approved" }));
+        let mut failed = LedgerEvent {
+            match_id: 456,
+            status: "archive_cached".to_owned(),
+            ..ledger_event("archive_cached")
+        };
+        failed.evidence = Some(json!({ "archiveChecksum": "failed-but-retained" }));
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&complete).unwrap(),
+            serde_json::to_string(&failed).unwrap()
+        );
+        fs::write(&path, &content).unwrap();
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        let mut args = backfill_args(&root);
+        args.cached_source_ledger = Some(path);
+        args.cached_source_ledger_sha256 = Some(digest);
+
+        let inventory = CachedSourceInventory::load(&args).unwrap().unwrap();
+        assert_eq!(
+            inventory.archive_checksums.get(&123).map(String::as_str),
+            Some("approved")
+        );
+        assert_eq!(
+            inventory.archive_checksums.get(&456).map(String::as_str),
+            Some("failed-but-retained")
+        );
+
+        let mut conflicting = failed.clone();
+        conflicting.evidence = Some(json!({ "archiveChecksum": "different" }));
+        let conflicting_content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&failed).unwrap(),
+            serde_json::to_string(&conflicting).unwrap()
+        );
+        fs::write(
+            args.cached_source_ledger.as_ref().unwrap(),
+            &conflicting_content,
+        )
+        .unwrap();
+        args.cached_source_ledger_sha256 =
+            Some(hex::encode(Sha256::digest(conflicting_content.as_bytes())));
+        assert!(CachedSourceInventory::load(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting archive checksums"));
+
+        args.cached_source_ledger_sha256 = Some("0".repeat(64));
+        assert!(CachedSourceInventory::load(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256 mismatch"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1810,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_apply_reuses_only_an_exact_cached_archive() {
+    fn cache_reuse_requires_an_exact_archive_checksum() {
         let root = test_path("cached-archive");
         let old_attempt = root.join("attempt-old");
         let current_attempt = root.join("attempt-current");
@@ -1821,17 +2023,23 @@ mod tests {
         let checksum = sha256_file(&archive).unwrap();
 
         assert_eq!(
-            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&checksum)).unwrap(),
+            checksum_matched_cached_archive(&root, &current_attempt, "7z", Some(&checksum))
+                .unwrap(),
             Some(archive)
         );
+        assert!(checksum_matched_cached_archive(
+            &root,
+            &current_attempt,
+            "7z",
+            Some(&"0".repeat(64)),
+        )
+        .unwrap()
+        .is_none());
         assert!(
-            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&"0".repeat(64)),)
+            checksum_matched_cached_archive(&root, &current_attempt, "7z", None)
                 .unwrap()
                 .is_none()
         );
-        assert!(reviewed_cached_archive(&root, &current_attempt, "7z", None)
-            .unwrap()
-            .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
