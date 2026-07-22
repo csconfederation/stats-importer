@@ -37,12 +37,22 @@ layouts), and asks CSC-Stats to fingerprint every demo. A historical BO3 archive
 is processed as one match-sized unit. It is dry-run only unless `--apply` and a
 matching `--confirm-season` are both provided.
 
-The Stats endpoint performs the mutation: it locks one exact Stats map,
-rechecks reviewed demo/current-data hashes, and transactionally replaces only
-its Round subtree. Match-level player stats and TeamStats are fingerprinted
-before and after. Any mismatch rolls the transaction back. Historical BO3 map
-suffixes are preserved from filenames, so zero-based, one-based, and
-non-contiguous series are supported; archive order is never used.
+For an existing Stats map, the Stats endpoint locks that exact map, rechecks
+reviewed demo/current-data hashes, and transactionally replaces only its Round
+subtree. Match-level player stats and TeamStats are fingerprinted before and
+after. If the logical Stats match does not exist, the reviewed apply uses the
+normal full-ingest path in create-only mode; it cannot replace a match that
+appeared after review. Both paths originate from a Core season match and use
+Core's season, tier, match-day, series, and played-map metadata.
+
+Historical BO3 map suffixes are preserved when usable. A stale embedded match
+ID is replaced with the authoritative Core ID only when it does not identify a
+different Core match in that season. A fully unnamed, complete BO3 archive can
+fall back to Core's distinct played-map order; partial or mixed-naming archives
+cannot use that fallback. The original archive path, identity source, and any
+displaced ID are retained in the ledger. An archive containing fewer demos than
+Core's played-map count is recorded as `partial_archive`, but each independently
+attributable demo is still validated and recovered.
 
 Review/apply binds `parserOutputChecksum` to the canonical repair inputs rather
 than the worker's raw JSON serialization. The endpoint also records
@@ -83,6 +93,14 @@ scripts/run-backfill-nice.sh \
   --parser-version 'worker-vX-demoScrape-vY@sha256:image-digest'
 ```
 
+Use `--keep-all` instead when every attempted workspace must be retained,
+including parse, validation, and apply failures. This is useful for a shared
+development cache where re-downloading historical archives would incur egress.
+`--keep-all` and `--keep-successful` are mutually exclusive. A reviewed apply
+can reuse a retained archive only when its SHA-256 matches that match's checksum
+in the approved dry-run ledger. Unreviewed dry runs download Core's current URL
+again because an object may have been replaced without changing its URL.
+
 After the dry run completes with no failures, freeze its ledger and record its
 digest. Apply refuses to run without this exact dry-run inventory (complete for
 the full season, or complete for every explicitly selected `--match-id`) and
@@ -107,15 +125,18 @@ scripts/run-backfill-nice.sh \
 Every status transition is appended and fsynced to a JSONL ledger under the
 workspace. Completed matches resume without replay. Extracted demos are deleted
 with their archive when that match finishes, and the whole per-attempt workspace
-is also deleted after a failure. `--keep-successful` is the only option that
-retains a completed match's archive and extracted demos. Peak working disk is
+is also deleted after a failure. `--keep-successful` retains completed matches;
+`--keep-all` retains completed and failed attempts. Peak working disk is
 therefore bounded to one compressed match archive plus that archive's extracted
-contents and the small ledger, subject to the configured size limits. A process
+contents and the small ledger, subject to the configured size limits when
+neither retention flag is used. Retained workspaces accumulate and must be
+capacity-planned separately. A process
 kill during the final ledger append discards only the incomplete trailing record
 on resume; newline-terminated/interior corruption still fails closed.
-Clean endpoint verdicts that cannot be repaired
-(`ingest_incomplete`, `no_matching_candidate`, `fingerprint_mismatch`, and
-`ambiguous`) are recorded as terminal `skipped_not_repairable` results, while a
-mixed BO3 still repairs its uniquely validated maps. The Core-match loop is
+Clean endpoint verdicts that cannot be recovered (`ingest_incomplete`,
+`fingerprint_mismatch`, and `ambiguous`) are recorded as terminal
+`skipped_not_repairable` results. `no_matching_candidate` is instead a reviewed
+create-only full import, while a mixed BO3 handles each uniquely identified map
+according to its verdict. The Core-match loop is
 strictly sequential, with no task spawning or buffered concurrency, and the
 runner pauses five seconds between matches by default.
