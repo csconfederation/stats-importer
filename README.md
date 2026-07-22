@@ -121,6 +121,10 @@ the current database normally. Matches without a reviewed archive checksum are
 downloaded from Core's current URL. Each successful download records an
 `archive_cached` event before extraction or parsing, so `--keep-all` retries can
 reuse parser-failed archives without treating the failed match as complete.
+The digest authenticates the selected ledger bytes; it does not prove that the
+ledger was reviewed or that Core's remote object is still current. The operator
+must review and approve that source ledger before intentionally choosing cache
+reuse over a fresh download.
 
 After the dry run completes with no failures, freeze its ledger and record its
 digest. Apply refuses to run without this exact dry-run inventory (complete for

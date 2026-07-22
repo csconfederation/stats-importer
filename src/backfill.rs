@@ -75,11 +75,7 @@ pub struct BackfillArgs {
     cached_source_ledger: Option<PathBuf>,
 
     /// SHA-256 of --cached-source-ledger.
-    #[arg(
-        long,
-        requires = "cached_source_ledger",
-        conflicts_with = "apply"
-    )]
+    #[arg(long, requires = "cached_source_ledger", conflicts_with = "apply")]
     cached_source_ledger_sha256: Option<String>,
 
     /// Seconds to pause after each Core match (default 5).
@@ -240,7 +236,10 @@ impl CachedSourceInventory {
                 continue;
             }
             let event: LedgerEvent = serde_json::from_str(line).with_context(|| {
-                format!("invalid cached source ledger JSON at line {}", line_number + 1)
+                format!(
+                    "invalid cached source ledger JSON at line {}",
+                    line_number + 1
+                )
             })?;
             if event.schema_version != 1 || event.season != args.season || event.mode != "dry-run" {
                 bail!(
@@ -273,7 +272,10 @@ impl CachedSourceInventory {
                 }
             }
         }
-        Ok(Some(Self { checksum, archive_checksums }))
+        Ok(Some(Self {
+            checksum,
+            archive_checksums,
+        }))
     }
 }
 
@@ -1225,17 +1227,21 @@ async fn process_match(
     )?;
     let (archive_path, archive_checksum) = if let Some(cached_archive) = cached_archive {
         let checksum = sha256_file(&cached_archive)?;
+        let evidence = if let Some(source) = cached_source_inventory {
+            json!({
+                "archiveChecksum": checksum,
+                "sourceInventoryChecksum": source.checksum,
+            })
+        } else {
+            json!({ "archiveChecksum": checksum })
+        };
         ledger.append(event(
             args,
             core_match.match_id,
             "using_cached_archive",
             None,
             Some(cached_archive.to_string_lossy().to_string()),
-            Some(json!({
-                "archiveChecksum": checksum,
-                "sourceInventoryChecksum": cached_source_inventory
-                    .map(|item| item.checksum.as_str()),
-            })),
+            Some(evidence),
         ))?;
         (cached_archive, checksum)
     } else {
@@ -1853,8 +1859,13 @@ mod tests {
             serde_json::to_string(&failed).unwrap(),
             serde_json::to_string(&conflicting).unwrap()
         );
-        fs::write(args.cached_source_ledger.as_ref().unwrap(), &conflicting_content).unwrap();
-        args.cached_source_ledger_sha256 = Some(hex::encode(Sha256::digest(conflicting_content.as_bytes())));
+        fs::write(
+            args.cached_source_ledger.as_ref().unwrap(),
+            &conflicting_content,
+        )
+        .unwrap();
+        args.cached_source_ledger_sha256 =
+            Some(hex::encode(Sha256::digest(conflicting_content.as_bytes())));
         assert!(CachedSourceInventory::load(&args)
             .unwrap_err()
             .to_string()
@@ -2016,14 +2027,19 @@ mod tests {
                 .unwrap(),
             Some(archive)
         );
+        assert!(checksum_matched_cached_archive(
+            &root,
+            &current_attempt,
+            "7z",
+            Some(&"0".repeat(64)),
+        )
+        .unwrap()
+        .is_none());
         assert!(
-            checksum_matched_cached_archive(&root, &current_attempt, "7z", Some(&"0".repeat(64)),)
+            checksum_matched_cached_archive(&root, &current_attempt, "7z", None)
                 .unwrap()
                 .is_none()
         );
-        assert!(checksum_matched_cached_archive(&root, &current_attempt, "7z", None)
-            .unwrap()
-            .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
