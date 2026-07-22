@@ -118,7 +118,9 @@ scripts/run-backfill-nice.sh \
 This option is dry-run-only. It reuses a file only when its SHA-256 equals the
 per-match `archiveChecksum` in the source ledger, then reparses it and evaluates
 the current database normally. Matches without a reviewed archive checksum are
-downloaded from Core's current URL.
+downloaded from Core's current URL. Each successful download records an
+`archive_cached` event before extraction or parsing, so `--keep-all` retries can
+reuse parser-failed archives without treating the failed match as complete.
 
 After the dry run completes with no failures, freeze its ledger and record its
 digest. Apply refuses to run without this exact dry-run inventory (complete for

@@ -129,7 +129,7 @@ struct CoreMatch {
     has_forfeit_audit: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedgerEvent {
     schema_version: u8,
     timestamp_unix: u64,
@@ -250,7 +250,10 @@ impl CachedSourceInventory {
             }
             if matches!(
                 event.status.as_str(),
-                "match_complete" | "skipped_not_repairable"
+                "archive_cached"
+                    | "using_cached_archive"
+                    | "match_complete"
+                    | "skipped_not_repairable"
             ) {
                 if let Some(value) = event
                     .evidence
@@ -258,7 +261,15 @@ impl CachedSourceInventory {
                     .and_then(|item| item.get("archiveChecksum"))
                     .and_then(Value::as_str)
                 {
-                    archive_checksums.insert(event.match_id, value.to_owned());
+                    if archive_checksums
+                        .insert(event.match_id, value.to_owned())
+                        .is_some_and(|previous| previous != value)
+                    {
+                        bail!(
+                            "cached source ledger has conflicting archive checksums for match {}",
+                            event.match_id
+                        );
+                    }
                 }
             }
         }
@@ -1244,6 +1255,17 @@ async fn process_match(
             args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
         )
         .await?;
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "archive_cached",
+            None,
+            Some(archive_path.to_string_lossy().to_string()),
+            Some(json!({
+                "archiveChecksum": checksum,
+                "objectKey": url.path(),
+            })),
+        ))?;
         (archive_path, checksum)
     };
     if let Some(reviewed) = reviewed_inventory {
@@ -1791,17 +1813,18 @@ mod tests {
     }
 
     #[test]
-    fn cached_source_inventory_requires_the_ledger_digest_and_terminal_checksum() {
+    fn cached_source_inventory_requires_the_ledger_digest_and_consistent_checksums() {
         let root = test_path("cached-source-inventory");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("source.jsonl");
         let mut complete = ledger_event("match_complete");
         complete.evidence = Some(json!({ "archiveChecksum": "approved" }));
-        let failed = LedgerEvent {
+        let mut failed = LedgerEvent {
             match_id: 456,
-            status: "match_failed".to_owned(),
-            ..ledger_event("match_failed")
+            status: "archive_cached".to_owned(),
+            ..ledger_event("archive_cached")
         };
+        failed.evidence = Some(json!({ "archiveChecksum": "failed-but-retained" }));
         let content = format!(
             "{}\n{}\n",
             serde_json::to_string(&complete).unwrap(),
@@ -1818,7 +1841,24 @@ mod tests {
             inventory.archive_checksums.get(&123).map(String::as_str),
             Some("approved")
         );
-        assert!(!inventory.archive_checksums.contains_key(&456));
+        assert_eq!(
+            inventory.archive_checksums.get(&456).map(String::as_str),
+            Some("failed-but-retained")
+        );
+
+        let mut conflicting = failed.clone();
+        conflicting.evidence = Some(json!({ "archiveChecksum": "different" }));
+        let conflicting_content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&failed).unwrap(),
+            serde_json::to_string(&conflicting).unwrap()
+        );
+        fs::write(args.cached_source_ledger.as_ref().unwrap(), &conflicting_content).unwrap();
+        args.cached_source_ledger_sha256 = Some(hex::encode(Sha256::digest(conflicting_content.as_bytes())));
+        assert!(CachedSourceInventory::load(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting archive checksums"));
 
         args.cached_source_ledger_sha256 = Some("0".repeat(64));
         assert!(CachedSourceInventory::load(&args)
