@@ -147,6 +147,28 @@ scripts/run-backfill-nice.sh \
   --parser-version 'worker-vX-demoScrape-vY@sha256:image-digest'
 ```
 
+For a one-pass recovery, `--direct-apply` validates each demo and immediately
+submits that exact checksum and fingerprint evidence for writing. It does not
+use or require a reviewed dry-run ledger. The explicit season confirmation is
+still mandatory, repairs retain the endpoint's optimistic-concurrency guards,
+and missing matches remain create-only. Each map commits independently;
+successful matches are resumable while failed matches are retried on a later
+invocation of the same command and ledger.
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 12 --direct-apply --confirm-season 12 --keep-all \
+  --cached-source-ledger /mnt/cs2-demos/round-repair-work/season-12-source.jsonl \
+  --cached-source-ledger-sha256 '<sha256-of-source-ledger>' \
+  --workspace /mnt/cs2-demos/round-repair-work \
+  --api-path-root /round-repair-work \
+  --parser-version 'worker-vX-demoScrape-vY@sha256:image-digest'
+```
+
+Use a new ledger path for direct apply. Because there is no approval boundary,
+the operator must verify the Core season, parser attestation, database backup,
+cache inventory digest, and target environment before starting.
+
 Every status transition is appended and fsynced to a JSONL ledger under the
 workspace. Completed matches resume without replay. Extracted demos are deleted
 with their archive when that match finishes, and the whole per-attempt workspace
