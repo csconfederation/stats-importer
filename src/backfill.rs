@@ -38,8 +38,16 @@ pub struct BackfillArgs {
     #[arg(long)]
     apply: bool,
 
-    /// Required with --apply to make an accidental write invocation obvious.
-    #[arg(long, requires = "apply")]
+    /// Validate and immediately apply each recoverable demo without a reviewed ledger.
+    #[arg(
+        long,
+        conflicts_with = "apply",
+        conflicts_with_all = ["reviewed_ledger", "reviewed_ledger_sha256"]
+    )]
+    direct_apply: bool,
+
+    /// Required with --apply or --direct-apply to make writes explicit.
+    #[arg(long)]
     confirm_season: Option<i32>,
 
     /// Version/profile configured by CSC-Stats for the pinned parser.
@@ -214,6 +222,22 @@ struct ReviewedInventory {
 struct CachedSourceInventory {
     checksum: String,
     archive_checksums: HashMap<i64, String>,
+}
+
+impl BackfillArgs {
+    fn writes(&self) -> bool {
+        self.apply || self.direct_apply
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.direct_apply {
+            "direct-apply"
+        } else if self.apply {
+            "apply"
+        } else {
+            "dry-run"
+        }
+    }
 }
 
 impl CachedSourceInventory {
@@ -569,7 +593,7 @@ fn event(
             .unwrap_or_default()
             .as_secs(),
         season: args.season,
-        mode: if args.apply { "apply" } else { "dry-run" }.to_owned(),
+        mode: args.mode().to_owned(),
         match_id,
         status: status.to_owned(),
         stats_match_id,
@@ -1483,43 +1507,47 @@ async fn process_match(
         return Ok(());
     }
 
-    if args.apply {
+    if args.writes() {
         for target in &ordered_targets {
             let Some(validations) = ready_by_target.get(target) else {
                 continue;
             };
             let validation = validations[0];
-            let reviewed = reviewed_inventory
-                .and_then(|inventory| {
-                    inventory.ready.get(&(
+            let apply_evidence = if let Some(inventory) = reviewed_inventory {
+                let reviewed = inventory
+                    .ready
+                    .get(&(
                         core_match.match_id,
                         validation.candidate.stats_match_id.clone(),
                         validation.candidate.checksum.clone(),
                     ))
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "ready candidate {} is absent from the reviewed dry-run inventory",
-                        validation.candidate.stats_match_id,
-                    )
-                })?;
-            for field in [
-                "sourceChecksum",
-                "parserOutputChecksum",
-                "parserVersion",
-                "storedFingerprintHash",
-                "parsedSubtreeHash",
-            ] {
-                if reviewed.get(field) != validation.response.get(field) {
-                    bail!("current validation differs from reviewed inventory at {field}");
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "ready candidate {} is absent from the reviewed dry-run inventory",
+                            validation.candidate.stats_match_id,
+                        )
+                    })?;
+                for field in [
+                    "sourceChecksum",
+                    "parserOutputChecksum",
+                    "parserVersion",
+                    "storedFingerprintHash",
+                    "parsedSubtreeHash",
+                ] {
+                    if reviewed.get(field) != validation.response.get(field) {
+                        bail!("current validation differs from reviewed inventory at {field}");
+                    }
                 }
-            }
-            let current_subtree = validation.response.get("currentSubtreeHash");
-            if current_subtree != reviewed.get("currentSubtreeHash")
-                && current_subtree != reviewed.get("parsedSubtreeHash")
-            {
-                bail!("current subtree is neither the reviewed before-state nor verified repaired state");
-            }
+                let current_subtree = validation.response.get("currentSubtreeHash");
+                if current_subtree != reviewed.get("currentSubtreeHash")
+                    && current_subtree != reviewed.get("parsedSubtreeHash")
+                {
+                    bail!("current subtree is neither the reviewed before-state nor verified repaired state");
+                }
+                reviewed
+            } else {
+                &validation.response
+            };
             let response = repair_request(
                 client,
                 args,
@@ -1528,7 +1556,7 @@ async fn process_match(
                 false,
                 &archive_checksum,
                 url.path(),
-                Some(reviewed),
+                Some(apply_evidence),
                 reviewed_inventory.map(|inventory| inventory.checksum.as_str()),
             )
             .await?;
@@ -1553,21 +1581,22 @@ async fn process_match(
                 continue;
             };
             let validation = validations[0];
-            let reviewed = reviewed_inventory
-                .and_then(|inventory| {
-                    inventory.importable.get(&(
+            if let Some(inventory) = reviewed_inventory {
+                let reviewed = inventory
+                    .importable
+                    .get(&(
                         core_match.match_id,
                         validation.candidate.stats_match_id.clone(),
                         validation.candidate.checksum.clone(),
                     ))
-                })
-                .ok_or_else(|| {
-                    anyhow!(
+                    .ok_or_else(|| {
+                        anyhow!(
                         "missing-match candidate {} is absent from the reviewed dry-run inventory",
                         validation.candidate.stats_match_id,
                     )
-                })?;
-            verify_reviewed_import(reviewed, &validation.response)?;
+                    })?;
+                verify_reviewed_import(reviewed, &validation.response)?;
+            }
             let response =
                 full_import_request(client, args, token, core_match, &validation.candidate).await?;
             ledger.append(event(
@@ -1589,9 +1618,13 @@ async fn process_match(
         Some(format!(
             "{} repair candidate(s) {}, {} missing map(s) {}, {} map(s) skipped as not repairable",
             ready_by_target.len(),
-            if args.apply { "repaired" } else { "validated" },
+            if args.writes() {
+                "repaired"
+            } else {
+                "validated"
+            },
             importable_by_target.len(),
-            if args.apply {
+            if args.writes() {
                 "imported"
             } else {
                 "validated for create-only import"
@@ -1613,8 +1646,14 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     if args.season <= 0 {
         bail!("--season must be positive");
     }
-    if args.apply && args.confirm_season != Some(args.season) {
-        bail!("--apply requires --confirm-season {}", args.season);
+    if args.writes() && args.confirm_season != Some(args.season) {
+        bail!(
+            "--apply and --direct-apply require --confirm-season {}",
+            args.season
+        );
+    }
+    if !args.writes() && args.confirm_season.is_some() {
+        bail!("--confirm-season is only valid with --apply or --direct-apply");
     }
     let reviewed_inventory = ReviewedInventory::load(&args)?;
     let cached_source_inventory = CachedSourceInventory::load(&args)?;
@@ -1628,11 +1667,8 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     fs::create_dir_all(&args.workspace)?;
     let _workspace_lock = WorkspaceLock::acquire(&args.workspace)?;
     let ledger_path = args.ledger.clone().unwrap_or_else(|| {
-        args.workspace.join(format!(
-            "season-{}-{}.jsonl",
-            args.season,
-            if args.apply { "apply" } else { "dry-run" }
-        ))
+        args.workspace
+            .join(format!("season-{}-{}.jsonl", args.season, args.mode()))
     });
     if let Some(reviewed_path) = &args.reviewed_ledger {
         if fs::canonicalize(reviewed_path)? == canonical_output_path(&ledger_path)? {
@@ -1657,7 +1693,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("csc-stats-historical-round-repair/1")
         .build()?;
-    let mode = if args.apply { "apply" } else { "dry-run" };
+    let mode = args.mode();
     let selected: HashSet<i64> = args.match_id.iter().copied().collect();
     let matches = season_matches(&pool, args.season).await?;
     let available: HashSet<i64> = matches.iter().map(|item| item.match_id).collect();
@@ -1753,6 +1789,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{Args as ClapArgs, Command, FromArgMatches};
 
     fn test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1798,6 +1835,7 @@ mod tests {
         BackfillArgs {
             season: 18,
             apply: false,
+            direct_apply: false,
             confirm_season: None,
             parser_version: "test-parser".to_owned(),
             workspace: workspace.to_path_buf(),
@@ -1816,6 +1854,53 @@ mod tests {
             max_extracted_gib: 32,
             max_archive_members: 100,
         }
+    }
+
+    #[test]
+    fn direct_apply_is_explicit_and_supports_checksum_bound_cache_reuse() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--direct-apply",
+                "--confirm-season",
+                "12",
+                "--parser-version",
+                "test-parser",
+                "--api-path-root",
+                "/round-repair-work",
+                "--cached-source-ledger",
+                "/tmp/source.jsonl",
+                "--cached-source-ledger-sha256",
+                "checksum",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.writes());
+        assert_eq!(args.mode(), "direct-apply");
+        assert!(args.cached_source_ledger.is_some());
+    }
+
+    #[test]
+    fn direct_apply_conflicts_with_reviewed_apply() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        assert!(command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--apply",
+                "--direct-apply",
+                "--confirm-season",
+                "12",
+                "--parser-version",
+                "test-parser",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
     }
 
     #[test]
