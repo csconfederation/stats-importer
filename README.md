@@ -46,11 +46,13 @@ appeared after review. Both paths originate from a Core season match and use
 Core's season, tier, match-day, series, and played-map metadata.
 
 Historical BO3 map suffixes are preserved when usable. A stale embedded match
-ID is replaced with the authoritative Core ID, and a filename with no match
-identity falls back to Core's played-map order. The original archive path and
-the identity source are retained in the ledger. An archive containing fewer
-demos than Core's played-map count is recorded as `partial_archive`, but each
-available demo is still validated and recovered independently.
+ID is replaced with the authoritative Core ID only when it does not identify a
+different Core match in that season. A fully unnamed, complete BO3 archive can
+fall back to Core's distinct played-map order; partial or mixed-naming archives
+cannot use that fallback. The original archive path, identity source, and any
+displaced ID are retained in the ledger. An archive containing fewer demos than
+Core's played-map count is recorded as `partial_archive`, but each independently
+attributable demo is still validated and recovered.
 
 Review/apply binds `parserOutputChecksum` to the canonical repair inputs rather
 than the worker's raw JSON serialization. The endpoint also records
@@ -94,11 +96,10 @@ scripts/run-backfill-nice.sh \
 Use `--keep-all` instead when every attempted workspace must be retained,
 including parse, validation, and apply failures. This is useful for a shared
 development cache where re-downloading historical archives would incur egress.
-`--keep-all` and `--keep-successful` are mutually exclusive.
-With `--keep-all`, a retry reuses a retained archive only when its recorded
-source URL exactly matches Core's current URL. On a reviewed apply, it can also
-reuse an older retained archive when its SHA-256 matches that match's checksum
-in the approved dry-run ledger; otherwise the archive is downloaded again.
+`--keep-all` and `--keep-successful` are mutually exclusive. A reviewed apply
+can reuse a retained archive only when its SHA-256 matches that match's checksum
+in the approved dry-run ledger. Unreviewed dry runs download Core's current URL
+again because an object may have been replaced without changing its URL.
 
 After the dry run completes with no failures, freeze its ledger and record its
 digest. Apply refuses to run without this exact dry-run inventory (complete for

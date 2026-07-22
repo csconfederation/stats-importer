@@ -136,6 +136,7 @@ struct DemoCandidate {
     stats_match_id: String,
     checksum: String,
     identity_source: String,
+    displaced_match_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -343,6 +344,31 @@ fn is_clean_non_repairable(classification: Option<&str>) -> bool {
     )
 }
 
+fn verify_reviewed_import(reviewed: &Value, current: &Value) -> Result<()> {
+    for field in [
+        "sourceChecksum",
+        "parserOutputChecksum",
+        "parserVersion",
+        "parsedSubtreeHash",
+    ] {
+        if reviewed.get(field).and_then(Value::as_str).is_none() {
+            bail!("reviewed missing-match candidate omitted {field}");
+        }
+        if reviewed.get(field) != current.get(field) {
+            bail!("current missing-match validation differs from reviewed inventory at {field}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_full_import_response(status: StatusCode, body: &str) -> Result<Value> {
+    if !status.is_success() {
+        bail!("Stats full-import endpoint returned {status}: {body}");
+    }
+    serde_json::from_str(body)
+        .with_context(|| format!("Stats full-import endpoint returned {status} with non-JSON body"))
+}
+
 struct WorkspaceLock {
     _file: fs::File,
 }
@@ -493,8 +519,8 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                    (ms.home_score = 0 AND ms.away_score = 1) OR
                    regexp_replace(coalesce(ms.score, ''), '\s+', '', 'g') IN ('1-0', '0-1')
                  ) AS legacy_one_zero,
-                 count(*)::bigint AS map_count,
-                 array_agg(ms.map_number ORDER BY ms.map_number) AS played_map_numbers
+                 count(DISTINCT ms.map_number)::bigint AS map_count,
+                 array_agg(DISTINCT ms.map_number ORDER BY ms.map_number) AS played_map_numbers
           FROM matches_matchstats ms
           GROUP BY ms.match_id
         ), audit_flags AS (
@@ -705,9 +731,8 @@ fn reviewed_cached_archive(
     current_attempt: &Path,
     extension: &str,
     expected_checksum: Option<&str>,
-    expected_source_url: Option<&str>,
 ) -> Result<Option<PathBuf>> {
-    if expected_checksum.is_none() && expected_source_url.is_none() {
+    if expected_checksum.is_none() {
         return Ok(None);
     }
     let expected_name = format!("archive.{extension}");
@@ -723,20 +748,20 @@ fn reviewed_cached_archive(
             .map(|expected| sha256_file(entry.path()).map(|actual| actual == expected))
             .transpose()?
             .unwrap_or(false);
-        let source_url_matches = expected_source_url.is_some_and(|expected| {
-            fs::read_to_string(entry.path().with_file_name("source-url.txt"))
-                .is_ok_and(|actual| actual == expected)
-        });
-        if checksum_matches || source_url_matches {
+        if checksum_matches {
             return Ok(Some(entry.path().to_path_buf()));
         }
     }
     Ok(None)
 }
 
-fn discover_demos(extracted: &Path, core_match: &CoreMatch) -> Result<Vec<DemoCandidate>> {
-    let exact_suffix = Regex::new(&format!(r"-mid{}-([0-9]+)(?:_|-)", core_match.match_id))?;
-    let any_suffix = Regex::new(r"-mid[0-9]+-([0-9]+)(?:_|-)")?;
+fn discover_demos(
+    extracted: &Path,
+    core_match: &CoreMatch,
+    season_match_ids: &HashSet<i64>,
+) -> Result<Vec<DemoCandidate>> {
+    let embedded_match = Regex::new(r"-mid([0-9]+)-")?;
+    let any_suffix = Regex::new(r"-mid([0-9]+)-([0-9]+)(?:_|-)")?;
     let mut paths = Vec::new();
     for entry in WalkDir::new(extracted)
         .follow_links(false)
@@ -760,32 +785,79 @@ fn discover_demos(extracted: &Path, core_match: &CoreMatch) -> Result<Vec<DemoCa
         bail!("archive contains no .dem files (recursive search included demo/ and demos/)");
     }
 
+    if core_match.is_bo3 {
+        let suffixed = paths
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|filename| any_suffix.is_match(filename))
+            })
+            .count();
+        if suffixed != paths.len() {
+            if suffixed != 0 {
+                bail!("BO3 archive mixes suffixed and unnamed demos; map attribution is ambiguous");
+            }
+            if paths.len() as i64 != core_match.map_count
+                || paths.len() != core_match.played_map_numbers.len()
+            {
+                bail!(
+                    "cannot use Core map order for {} unnamed demos when Core records {} distinct played maps",
+                    paths.len(),
+                    core_match.map_count,
+                );
+            }
+        }
+    }
+
     let mut demos = Vec::new();
     for (index, path) in paths.into_iter().enumerate() {
         let filename = path
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or_else(|| anyhow!("demo filename is not UTF-8"))?;
+        let embedded_id = embedded_match
+            .captures(filename)
+            .and_then(|captures| captures.get(1))
+            .map(|value| value.as_str().parse::<i64>())
+            .transpose()?;
+        let displaced_match_id = embedded_id.filter(|value| *value != core_match.match_id);
+        if displaced_match_id.is_some_and(|value| season_match_ids.contains(&value)) {
+            bail!(
+                "archive for Core match {} contains demo {} belonging to Core match {} in the same season",
+                core_match.match_id,
+                filename,
+                displaced_match_id.unwrap(),
+            );
+        }
+        let suffix = any_suffix.captures(filename).and_then(|captures| {
+            Some((
+                captures.get(1)?.as_str().parse::<i64>().ok()?,
+                captures.get(2)?.as_str(),
+            ))
+        });
         let (stats_match_id, identity_source) = if !core_match.is_bo3 {
-            (core_match.match_id.to_string(), "core_bo1".to_owned())
-        } else if let Some(map_suffix) = exact_suffix
-            .captures(filename)
-            .and_then(|captures| captures.get(1))
-        {
             (
-                format!("{}_{}", core_match.match_id, map_suffix.as_str()),
-                "exact_filename".to_owned(),
+                core_match.match_id.to_string(),
+                if displaced_match_id.is_some() {
+                    "core_id_normalized"
+                } else {
+                    "core_bo1"
+                }
+                .to_owned(),
             )
-        } else if let Some(map_suffix) = any_suffix
-            .captures(filename)
-            .and_then(|captures| captures.get(1))
-        {
+        } else if let Some((embedded_id, map_suffix)) = suffix {
             // The archive URL is attached to this exact Core match. Preserve
-            // the historical map suffix while replacing a stale/mistyped
-            // embedded match ID with the authoritative Core ID.
+            // the historical map suffix. A displaced ID is accepted only
+            // when it does not identify another Core match in this season.
             (
-                format!("{}_{}", core_match.match_id, map_suffix.as_str()),
-                "core_id_normalized".to_owned(),
+                format!("{}_{}", core_match.match_id, map_suffix),
+                if embedded_id == core_match.match_id {
+                    "exact_filename"
+                } else {
+                    "core_id_normalized"
+                }
+                .to_owned(),
             )
         } else {
             let map_number = core_match
@@ -809,6 +881,7 @@ fn discover_demos(extracted: &Path, core_match: &CoreMatch) -> Result<Vec<DemoCa
             path,
             stats_match_id,
             identity_source,
+            displaced_match_id,
         });
     }
     Ok(demos)
@@ -924,6 +997,10 @@ async fn full_import_request(
         "matchType": if core_match.is_bo3 { "Playoff" } else { "Regulation" },
         "season": args.season,
         "tier": tier,
+        "traceId": format!(
+            "historical-recovery-s{}-core{}-stats{}",
+            args.season, core_match.match_id, demo.stats_match_id
+        ),
         "createOnly": true,
         "fixCoreScores": false,
         "fixTeamNames": false,
@@ -935,14 +1012,11 @@ async fn full_import_request(
         .send()
         .await?;
     let status = response.status();
-    let value: Value = response
-        .json()
+    let response_text = response
+        .text()
         .await
-        .context("Stats full-import endpoint returned non-JSON")?;
-    if !status.is_success() {
-        bail!("Stats full-import endpoint returned {status}: {value}");
-    }
-    Ok(value)
+        .context("failed to read Stats full-import response")?;
+    parse_full_import_response(status, &response_text)
 }
 
 fn remove_isolated_directory(root: &Path, path: &Path) -> Result<()> {
@@ -983,6 +1057,7 @@ async fn process_match(
     token: &str,
     ledger: &mut Ledger,
     core_match: &CoreMatch,
+    season_match_ids: &HashSet<i64>,
     reviewed_inventory: Option<&ReviewedInventory>,
 ) -> Result<()> {
     if core_match.marked_forfeit || core_match.legacy_one_zero || core_match.has_forfeit_audit {
@@ -1058,18 +1133,17 @@ async fn process_match(
         &match_workspace,
         extension,
         reviewed_archive_checksum,
-        args.keep_all.then_some(url.as_str()),
     )?;
     let (archive_path, archive_checksum) = if let Some(cached_archive) = cached_archive {
+        let checksum = sha256_file(&cached_archive)?;
         ledger.append(event(
             args,
             core_match.match_id,
             "using_cached_archive",
             None,
             Some(cached_archive.to_string_lossy().to_string()),
-            Some(json!({ "archiveChecksum": reviewed_archive_checksum })),
+            Some(json!({ "archiveChecksum": checksum })),
         ))?;
-        let checksum = sha256_file(&cached_archive)?;
         (cached_archive, checksum)
     } else {
         let archive_path = match_workspace.join(format!("archive.{extension}"));
@@ -1088,7 +1162,6 @@ async fn process_match(
             args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
         )
         .await?;
-        fs::write(archive_path.with_file_name("source-url.txt"), url.as_str())?;
         (archive_path, checksum)
     };
     if let Some(reviewed) = reviewed_inventory {
@@ -1108,7 +1181,7 @@ async fn process_match(
     )?;
     let extracted = match_workspace.join("extracted");
     extract_archive(&archive_path, &extracted)?;
-    let demos = discover_demos(&extracted, core_match)?;
+    let demos = discover_demos(&extracted, core_match, season_match_ids)?;
 
     if core_match.map_count > 0 && (demos.len() as i64) < core_match.map_count {
         ledger.append(event(
@@ -1152,6 +1225,7 @@ async fn process_match(
                 "demo": demo.relative_path,
                 "demoChecksum": demo.checksum,
                 "identitySource": demo.identity_source,
+                "displacedMatchId": demo.displaced_match_id,
                 "coreMatch": {
                     "matchId": core_match.match_id,
                     "season": args.season,
@@ -1369,7 +1443,7 @@ async fn process_match(
                 continue;
             };
             let validation = validations[0];
-            if reviewed_inventory
+            let reviewed = reviewed_inventory
                 .and_then(|inventory| {
                     inventory.importable.get(&(
                         core_match.match_id,
@@ -1377,13 +1451,13 @@ async fn process_match(
                         validation.candidate.checksum.clone(),
                     ))
                 })
-                .is_none()
-            {
-                bail!(
-                    "missing-match candidate {} is absent from the reviewed dry-run inventory",
-                    validation.candidate.stats_match_id,
-                );
-            }
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing-match candidate {} is absent from the reviewed dry-run inventory",
+                        validation.candidate.stats_match_id,
+                    )
+                })?;
+            verify_reviewed_import(reviewed, &validation.response)?;
             let response =
                 full_import_request(client, args, token, core_match, &validation.candidate).await?;
             ledger.append(event(
@@ -1530,6 +1604,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             &token,
             &mut ledger,
             &core_match,
+            &available,
             reviewed_inventory.as_ref(),
         )
         .await
@@ -1646,7 +1721,8 @@ mod tests {
         fs::write(root.join("s11-mid123-0_root.dem"), b"a").unwrap();
         fs::write(root.join("demo/deeper/s11-mid123-1_nested.DEM"), b"b").unwrap();
         fs::write(root.join("demos/ignore.txt"), b"c").unwrap();
-        let mut found = discover_demos(&root, &core_match(123, true)).unwrap();
+        let mut found =
+            discover_demos(&root, &core_match(123, true), &HashSet::from([123])).unwrap();
         found.sort_by(|a, b| a.stats_match_id.cmp(&b.stats_match_id));
         assert_eq!(
             found
@@ -1665,7 +1741,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("s11-mid456-7_map.dem"), b"demo").unwrap();
-        let found = discover_demos(&root, &core_match(456, false)).unwrap();
+        let found = discover_demos(&root, &core_match(456, false), &HashSet::from([456])).unwrap();
         assert_eq!(found[0].stats_match_id, "456");
         fs::remove_dir_all(root).unwrap();
     }
@@ -1675,7 +1751,7 @@ mod tests {
         let root = test_path("normalize-mid");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("s12-mid999-2_mirage.dem"), b"demo").unwrap();
-        let found = discover_demos(&root, &core_match(456, true)).unwrap();
+        let found = discover_demos(&root, &core_match(456, true), &HashSet::from([456])).unwrap();
         assert_eq!(found[0].stats_match_id, "456_2");
         assert_eq!(found[0].identity_source, "core_id_normalized");
         fs::remove_dir_all(root).unwrap();
@@ -1690,13 +1766,47 @@ mod tests {
         let mut core = core_match(456, true);
         core.played_map_numbers = vec![1, 3];
         core.map_count = 2;
-        let found = discover_demos(&root, &core).unwrap();
+        let found = discover_demos(&root, &core, &HashSet::from([456])).unwrap();
         assert_eq!(found[0].stats_match_id, "456_1");
         assert_eq!(found[1].stats_match_id, "456_3");
         assert!(found
             .iter()
             .all(|demo| demo.identity_source == "core_map_order"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_embedded_core_match_in_the_same_season_fails_closed() {
+        for is_bo3 in [false, true] {
+            let root = test_path(if is_bo3 { "foreign-bo3" } else { "foreign-bo1" });
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("s12-mid999-1_mirage.dem"), b"demo").unwrap();
+            let error = discover_demos(&root, &core_match(456, is_bo3), &HashSet::from([456, 999]))
+                .unwrap_err();
+            assert!(error.to_string().contains("belonging to Core match 999"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn core_map_order_rejects_partial_and_mixed_archives() {
+        let partial_root = test_path("partial-unnamed");
+        fs::create_dir_all(&partial_root).unwrap();
+        fs::write(partial_root.join("first.dem"), b"a").unwrap();
+        let mut core = core_match(456, true);
+        core.played_map_numbers = vec![1, 2];
+        core.map_count = 2;
+        let partial = discover_demos(&partial_root, &core, &HashSet::from([456])).unwrap_err();
+        assert!(partial.to_string().contains("cannot use Core map order"));
+        fs::remove_dir_all(partial_root).unwrap();
+
+        let mixed_root = test_path("mixed-naming");
+        fs::create_dir_all(&mixed_root).unwrap();
+        fs::write(mixed_root.join("s12-mid456-1_mirage.dem"), b"a").unwrap();
+        fs::write(mixed_root.join("second.dem"), b"b").unwrap();
+        let mixed = discover_demos(&mixed_root, &core, &HashSet::from([456])).unwrap_err();
+        assert!(mixed.to_string().contains("mixes suffixed and unnamed"));
+        fs::remove_dir_all(mixed_root).unwrap();
     }
 
     #[test]
@@ -1711,49 +1821,17 @@ mod tests {
         let checksum = sha256_file(&archive).unwrap();
 
         assert_eq!(
-            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&checksum), None).unwrap(),
+            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&checksum)).unwrap(),
             Some(archive)
         );
-        assert!(reviewed_cached_archive(
-            &root,
-            &current_attempt,
-            "7z",
-            Some(&"0".repeat(64)),
-            None,
-        )
-        .unwrap()
-        .is_none());
         assert!(
-            reviewed_cached_archive(&root, &current_attempt, "7z", None, None)
+            reviewed_cached_archive(&root, &current_attempt, "7z", Some(&"0".repeat(64)),)
                 .unwrap()
                 .is_none()
         );
-
-        fs::write(
-            old_attempt.join("source-url.txt"),
-            "https://example.invalid/archive.7z",
-        )
-        .unwrap();
-        assert_eq!(
-            reviewed_cached_archive(
-                &root,
-                &current_attempt,
-                "7z",
-                None,
-                Some("https://example.invalid/archive.7z"),
-            )
-            .unwrap(),
-            Some(old_attempt.join("archive.7z"))
-        );
-        assert!(reviewed_cached_archive(
-            &root,
-            &current_attempt,
-            "7z",
-            None,
-            Some("https://example.invalid/different.7z"),
-        )
-        .unwrap()
-        .is_none());
+        assert!(reviewed_cached_archive(&root, &current_attempt, "7z", None)
+            .unwrap()
+            .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1809,6 +1887,40 @@ mod tests {
         assert!(!is_clean_non_repairable(Some("no_matching_candidate")));
         assert!(!is_clean_non_repairable(Some("ready")));
         assert!(!is_clean_non_repairable(None));
+    }
+
+    #[test]
+    fn missing_match_apply_is_bound_to_reviewed_parser_evidence() {
+        let reviewed = json!({
+            "sourceChecksum": "source-a",
+            "parserOutputChecksum": "parser-a",
+            "parserVersion": "worker-v1",
+            "parsedSubtreeHash": "subtree-a",
+        });
+        assert!(verify_reviewed_import(&reviewed, &reviewed).is_ok());
+
+        let mut changed = reviewed.clone();
+        changed["parserVersion"] = json!("worker-v2");
+        assert!(verify_reviewed_import(&reviewed, &changed)
+            .unwrap_err()
+            .to_string()
+            .contains("parserVersion"));
+
+        let legacy = json!({ "sourceChecksum": "source-a" });
+        assert!(verify_reviewed_import(&legacy, &reviewed)
+            .unwrap_err()
+            .to_string()
+            .contains("omitted parserOutputChecksum"));
+    }
+
+    #[test]
+    fn full_import_error_preserves_status_for_non_json_bodies() {
+        let error =
+            parse_full_import_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("500 Internal Server Error"));
+        assert!(error.contains("Internal Server Error"));
     }
 
     #[test]
