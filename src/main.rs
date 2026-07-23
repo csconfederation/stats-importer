@@ -143,6 +143,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 season: i32::from(season),
                 match_day,
                 is_series: false,
+                match_date: None,
             }
         }
     };
@@ -186,6 +187,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         tier: match_info.tier,
         match_day: match_info.match_day,
         match_type,
+        match_date: match_info.match_date,
         fix_core_scores: args.fix_core_scores.unwrap_or(false),
         fix_team_names: args.fix_team_names.unwrap_or(false),
     };
@@ -211,6 +213,8 @@ struct StatsRequestBody {
     tier: String,
     match_day: String,
     match_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_date: Option<String>,
     fix_core_scores: bool,
     fix_team_names: bool,
 }
@@ -221,12 +225,14 @@ struct MatchInfo {
     tier: String,
     match_day: String,
     is_series: bool,
+    match_date: Option<String>,
 }
 
 #[derive(Debug, FromRow, Clone)]
 struct CombineMatch {
     match_id: Option<String>,
     tier: String,
+    match_date: Option<String>,
 }
 
 async fn get_core_match(
@@ -238,7 +244,13 @@ async fn get_core_match(
     if !is_combine {
         Ok(sqlx::query_as::<_, MatchInfo>(
             r#"
-        select mm.id::varchar as match_id, ls.number as season, pt.name as tier, is_bo3 as is_series, lm.number as match_day
+        select mm.id::varchar as match_id,
+               ls.number as season,
+               pt.name as tier,
+               is_bo3 as is_series,
+               lm.number as match_day,
+               to_char(coalesce(mm.completed_at, mm.scheduled_date) AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as match_date
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
                 join leagues_seasons ls on ls.id = lm.season_id
@@ -254,12 +266,15 @@ async fn get_core_match(
         .await?)
     } else {
         let m = sqlx::query_as::<_, CombineMatch>(
-            "
-        select mm.id::varchar as match_id, pt.name as tier
+            r#"
+        select mm.id::varchar as match_id,
+               pt.name as tier,
+               to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as match_date
             from matches_combinematches mm
                 join players_tiers pt on mm.tier_id = pt.id
         where mm.id = $1;
-    ",
+    "#,
         )
         .bind(id)
         .fetch_one(pool)
@@ -273,6 +288,7 @@ async fn get_core_match(
             tier: m.tier,
             match_day: String::new(),
             is_series: false,
+            match_date: m.match_date,
         })
     }
 }
