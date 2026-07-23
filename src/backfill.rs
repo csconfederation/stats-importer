@@ -1010,6 +1010,7 @@ async fn repair_request(
     client: &Client,
     args: &BackfillArgs,
     token: &str,
+    core_match: &CoreMatch,
     demo: &DemoCandidate,
     dry_run: bool,
     archive_checksum: &str,
@@ -1021,6 +1022,7 @@ async fn repair_request(
     let mut body = json!({
         "path": api_path(args, &demo.path)?,
         "statsMatchId": demo.stats_match_id,
+        "matchDate": core_match.match_date,
         "dryRun": dry_run,
         "parserVersion": args.parser_version,
         "source": {
@@ -1049,10 +1051,11 @@ async fn repair_request(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("dry-run response omitted parsedSubtreeHash"))?;
         let idempotency_key = hex::encode(Sha256::digest(format!(
-            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v3\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             demo.stats_match_id,
             demo.checksum,
             args.parser_version,
+            core_match.match_date,
             stored,
             subtree,
             parser_output,
@@ -1345,6 +1348,7 @@ async fn process_match(
             client,
             args,
             token,
+            core_match,
             &demo,
             true,
             &archive_checksum,
@@ -1535,6 +1539,7 @@ async fn process_match(
                     "sourceChecksum",
                     "parserOutputChecksum",
                     "parserVersion",
+                    "matchDate",
                     "storedFingerprintHash",
                     "parsedSubtreeHash",
                 ] {
@@ -1556,6 +1561,7 @@ async fn process_match(
                 client,
                 args,
                 token,
+                core_match,
                 &validation.candidate,
                 false,
                 &archive_checksum,

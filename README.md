@@ -44,8 +44,9 @@ after. If the logical Stats match does not exist, the reviewed apply uses the
 normal full-ingest path in create-only mode; it cannot replace a match that
 appeared after review. Both paths originate from a Core season match and use
 Core's season, tier, match-day, series, and played-map metadata.
-Full imports also send Core's completion date to Stats, falling back to the
-scheduled date, so historical reparses retain the match date rather than the
+Both round repairs and full imports send Core's completion date to Stats,
+falling back to the scheduled date. Applied reparses overwrite the stored Stats
+match date so historical matches retain their real chronology rather than the
 import date.
 
 Historical BO3 map suffixes are preserved when usable. A stale embedded match
