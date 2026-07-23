@@ -127,6 +127,7 @@ struct CoreMatch {
     map_count: i64,
     played_map_numbers: Vec<i32>,
     match_day: String,
+    match_date: String,
     tier: Option<String>,
     marked_forfeit: bool,
     legacy_one_zero: bool,
@@ -639,6 +640,8 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(sf.map_count, 0)::bigint AS map_count,
                coalesce(sf.played_map_numbers, ARRAY[]::integer[]) AS played_map_numbers,
                md.number::text AS match_day,
+               to_char(coalesce(m.completed_at, m.scheduled_date) AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date,
                coalesce(home_tier.name, away_tier.name) AS tier,
                coalesce(sf.marked_forfeit, false) AS marked_forfeit,
                coalesce(sf.legacy_one_zero, false) AS legacy_one_zero,
@@ -1007,6 +1010,7 @@ async fn repair_request(
     client: &Client,
     args: &BackfillArgs,
     token: &str,
+    core_match: &CoreMatch,
     demo: &DemoCandidate,
     dry_run: bool,
     archive_checksum: &str,
@@ -1018,6 +1022,7 @@ async fn repair_request(
     let mut body = json!({
         "path": api_path(args, &demo.path)?,
         "statsMatchId": demo.stats_match_id,
+        "matchDate": core_match.match_date,
         "dryRun": dry_run,
         "parserVersion": args.parser_version,
         "source": {
@@ -1046,10 +1051,11 @@ async fn repair_request(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("dry-run response omitted parsedSubtreeHash"))?;
         let idempotency_key = hex::encode(Sha256::digest(format!(
-            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v3\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             demo.stats_match_id,
             demo.checksum,
             args.parser_version,
+            core_match.match_date,
             stored,
             subtree,
             parser_output,
@@ -1100,6 +1106,7 @@ async fn full_import_request(
         "matchId": demo.stats_match_id,
         "matchDay": core_match.match_day,
         "matchType": if core_match.is_bo3 { "Playoff" } else { "Regulation" },
+        "matchDate": core_match.match_date,
         "season": args.season,
         "tier": tier,
         "traceId": format!(
@@ -1341,6 +1348,7 @@ async fn process_match(
             client,
             args,
             token,
+            core_match,
             &demo,
             true,
             &archive_checksum,
@@ -1531,6 +1539,7 @@ async fn process_match(
                     "sourceChecksum",
                     "parserOutputChecksum",
                     "parserVersion",
+                    "matchDate",
                     "storedFingerprintHash",
                     "parsedSubtreeHash",
                 ] {
@@ -1552,6 +1561,7 @@ async fn process_match(
                 client,
                 args,
                 token,
+                core_match,
                 &validation.candidate,
                 false,
                 &archive_checksum,
@@ -1824,6 +1834,7 @@ mod tests {
             map_count: 1,
             played_map_numbers: vec![1],
             match_day: "M01".to_owned(),
+            match_date: "2023-02-17T03:00:00.000000Z".to_owned(),
             tier: Some("Elite".to_owned()),
             marked_forfeit: false,
             legacy_one_zero: false,
