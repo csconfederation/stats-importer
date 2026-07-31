@@ -35,24 +35,42 @@ pub struct BackfillArgs {
     season: i32,
 
     /// Apply verified repairs. Without this flag the run is read-only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "full_reparse")]
     apply: bool,
 
     /// Validate and immediately apply each recoverable demo without a reviewed ledger.
     #[arg(
         long,
-        conflicts_with = "apply",
-        conflicts_with_all = ["reviewed_ledger", "reviewed_ledger_sha256"]
+        conflicts_with_all = ["apply", "full_reparse", "reviewed_ledger", "reviewed_ledger_sha256"]
     )]
     direct_apply: bool,
 
-    /// Required with --apply or --direct-apply to make writes explicit.
+    /// Skip round-level repair and instead reparse every season demo through the
+    /// full add-match ingest path (createOnly=false), so eco/swing stats and any
+    /// ingest-side fixes land on historical matches. Without --confirm-season this
+    /// only downloads/discovers demos and reports what would be reparsed. There is
+    /// no reviewed-ledger flow for this mode: add-match reparses are safe to rerun
+    /// (existing rows are replaced transactionally), so it does not need the
+    /// round-repair path's dry-run/apply review gate.
+    #[arg(
+        long,
+        conflicts_with_all = ["apply", "direct_apply", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256"]
+    )]
+    full_reparse: bool,
+
+    /// Required with --apply, --direct-apply, or --full-reparse to make writes explicit.
     #[arg(long)]
     confirm_season: Option<i32>,
 
-    /// Version/profile configured by CSC-Stats for the pinned parser.
-    #[arg(long, env = "STATS_REPAIR_PARSER_VERSION")]
-    parser_version: String,
+    /// Version/profile configured by CSC-Stats for the pinned parser. Required for
+    /// round-repair modes; unused (and not required) by --full-reparse, which has
+    /// no parser-version attestation concept on the add-match endpoint.
+    #[arg(
+        long,
+        env = "STATS_REPAIR_PARSER_VERSION",
+        required_unless_present = "full_reparse"
+    )]
+    parser_version: Option<String>,
 
     /// Host directory used for downloads/extraction; it must be shared with CSC-Stats.
     #[arg(long, default_value = "./round-repair-work")]
@@ -227,7 +245,7 @@ struct CachedSourceInventory {
 
 impl BackfillArgs {
     fn writes(&self) -> bool {
-        self.apply || self.direct_apply
+        self.apply || self.direct_apply || (self.full_reparse && self.confirm_season.is_some())
     }
 
     fn mode(&self) -> &'static str {
@@ -235,6 +253,12 @@ impl BackfillArgs {
             "direct-apply"
         } else if self.apply {
             "apply"
+        } else if self.full_reparse {
+            if self.confirm_season.is_some() {
+                "full-reparse"
+            } else {
+                "full-reparse-dry-run"
+            }
         } else {
             "dry-run"
         }
@@ -1019,12 +1043,16 @@ async fn repair_request(
     inventory_checksum: Option<&str>,
 ) -> Result<Value> {
     let stats_url = env::var("STATS_API_URL").context("STATS_API_URL is required")?;
+    let parser_version = args
+        .parser_version
+        .as_deref()
+        .context("--parser-version is required for round-repair mode")?;
     let mut body = json!({
         "path": api_path(args, &demo.path)?,
         "statsMatchId": demo.stats_match_id,
         "matchDate": core_match.match_date,
         "dryRun": dry_run,
-        "parserVersion": args.parser_version,
+        "parserVersion": parser_version,
         "source": {
             "archiveChecksum": archive_checksum,
             "objectKey": archive_object_key,
@@ -1054,7 +1082,7 @@ async fn repair_request(
             "v3\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             demo.stats_match_id,
             demo.checksum,
-            args.parser_version,
+            parser_version,
             core_match.match_date,
             stored,
             subtree,
@@ -1095,6 +1123,7 @@ async fn full_import_request(
     token: &str,
     core_match: &CoreMatch,
     demo: &DemoCandidate,
+    create_only: bool,
 ) -> Result<Value> {
     let stats_url = env::var("STATS_API_URL").context("STATS_API_URL is required")?;
     let tier = core_match
@@ -1113,7 +1142,7 @@ async fn full_import_request(
             "historical-recovery-s{}-core{}-stats{}",
             args.season, core_match.match_id, demo.stats_match_id
         ),
-        "createOnly": true,
+        "createOnly": create_only,
         "fixCoreScores": false,
         "fixTeamNames": false,
     });
@@ -1340,6 +1369,76 @@ async fn process_match(
                 "coreMapNumbers": core_match.played_map_numbers,
             })),
         ))?;
+    }
+
+    if args.full_reparse {
+        if demos.is_empty() {
+            ledger.append(event(
+                args,
+                core_match.match_id,
+                "skipped_not_repairable",
+                None,
+                Some("no demos discovered in archive".to_owned()),
+                Some(json!({ "archiveChecksum": archive_checksum })),
+            ))?;
+            attempt_workspace.finish(args.keep_successful || args.keep_all)?;
+            return Ok(());
+        }
+        for demo in &demos {
+            if args.writes() {
+                let response =
+                    full_import_request(client, args, token, core_match, demo, false).await?;
+                ledger.append(event(
+                    args,
+                    core_match.match_id,
+                    "full_reparse_applied",
+                    Some(demo.stats_match_id.clone()),
+                    None,
+                    Some(json!({
+                        "demo": demo.relative_path,
+                        "demoChecksum": demo.checksum,
+                        "identitySource": demo.identity_source,
+                        "displacedMatchId": demo.displaced_match_id,
+                        "result": response,
+                    })),
+                ))?;
+            } else {
+                ledger.append(event(
+                    args,
+                    core_match.match_id,
+                    "full_reparse_planned",
+                    Some(demo.stats_match_id.clone()),
+                    None,
+                    Some(json!({
+                        "demo": demo.relative_path,
+                        "demoChecksum": demo.checksum,
+                        "identitySource": demo.identity_source,
+                        "displacedMatchId": demo.displaced_match_id,
+                    })),
+                ))?;
+            }
+        }
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "match_complete",
+            None,
+            Some(format!(
+                "{} map(s) {}",
+                demos.len(),
+                if args.writes() {
+                    "reparsed"
+                } else {
+                    "validated for full reparse"
+                }
+            )),
+            Some(json!({
+                "archiveChecksum": archive_checksum,
+                "targets": demos.iter().map(|d| d.stats_match_id.clone()).collect::<Vec<_>>(),
+            })),
+        ))?;
+        attempt_workspace.finish(args.keep_successful || args.keep_all)?;
+        return Ok(());
     }
 
     let mut validations = Vec::new();
@@ -1608,7 +1707,8 @@ async fn process_match(
                 verify_reviewed_import(reviewed, &validation.response)?;
             }
             let response =
-                full_import_request(client, args, token, core_match, &validation.candidate).await?;
+                full_import_request(client, args, token, core_match, &validation.candidate, true)
+                    .await?;
             ledger.append(event(
                 args,
                 core_match.match_id,
@@ -1658,12 +1758,12 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     if args.writes() && args.confirm_season != Some(args.season) {
         bail!(
-            "--apply and --direct-apply require --confirm-season {}",
+            "--apply, --direct-apply, and --full-reparse require --confirm-season {}",
             args.season
         );
     }
     if !args.writes() && args.confirm_season.is_some() {
-        bail!("--confirm-season is only valid with --apply or --direct-apply");
+        bail!("--confirm-season is only valid with --apply, --direct-apply, or --full-reparse");
     }
     let reviewed_inventory = ReviewedInventory::load(&args)?;
     let cached_source_inventory = CachedSourceInventory::load(&args)?;
@@ -1847,8 +1947,9 @@ mod tests {
             season: 18,
             apply: false,
             direct_apply: false,
+            full_reparse: false,
             confirm_season: None,
-            parser_version: "test-parser".to_owned(),
+            parser_version: Some("test-parser".to_owned()),
             workspace: workspace.to_path_buf(),
             api_path_root: workspace.to_path_buf(),
             ledger: None,
@@ -1908,6 +2009,73 @@ mod tests {
                 "12",
                 "--parser-version",
                 "test-parser",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn full_reparse_does_not_require_parser_version_and_defaults_to_dry_run() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--full-reparse",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.parser_version.is_none());
+        assert!(!args.writes());
+        assert_eq!(args.mode(), "full-reparse-dry-run");
+    }
+
+    #[test]
+    fn full_reparse_writes_only_once_confirm_season_is_supplied() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--full-reparse",
+                "--confirm-season",
+                "12",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.writes());
+        assert_eq!(args.mode(), "full-reparse");
+    }
+
+    #[test]
+    fn full_reparse_conflicts_with_round_repair_modes() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--full-reparse",
+                "--apply",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--full-reparse",
+                "--direct-apply",
                 "--api-path-root",
                 "/round-repair-work",
             ])
