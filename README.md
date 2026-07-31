@@ -191,3 +191,50 @@ create-only full import, while a mixed BO3 handles each uniquely identified map
 according to its verdict. The Core-match loop is
 strictly sequential, with no task spawning or buffered concurrency, and the
 runner pauses five seconds between matches by default.
+
+## Full reparse (eco/swing stats and other ingest-side fixes)
+
+Round-level repair only replaces a match's Round subtree; it explicitly leaves
+match-level `PlayerMatchStats`, `TeamStats`, and `Match` untouched (it
+fingerprints them before and after to prove that). That means round-repair
+never backfills the fragg-3.0 eco/swing columns (`Match.ecoStatsOK`,
+`PlayerMatchStats.swing_rating`/`eco*`) onto historical matches — those live on
+the match-level row. To get eco stats (or any other add-match-ingest-side fix)
+onto historical matches, use `--full-reparse` instead: it reuses the same
+season inventory, archive download, and demo discovery as round-repair, but
+POSTs every discovered demo through the normal `/api/add-match` ingest path
+with `createOnly: false` rather than `/api/repair-round-stats`. CSC-Stats
+deletes and recreates the match transactionally (parse happens before the
+delete, so a parser failure never destroys existing data), so this is safe to
+rerun.
+
+`--full-reparse` has no round-level fingerprint/checksum review flow and no
+`--parser-version` requirement (add-match has no parser-version attestation
+concept) — a match is either reparsed or it isn't. Without `--confirm-season`
+it only downloads and discovers demos and records what it *would* reparse
+(`full_reparse_planned` ledger events); nothing is written. It cannot be
+combined with `--apply`, `--direct-apply`, or the reviewed/cached-source-ledger
+flags.
+
+Dry-run (discover only, no writes):
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 19 --full-reparse \
+  --workspace /home/csc-core/core-docker/demos/round-repair-work \
+  --api-path-root /demos/round-repair-work
+```
+
+Apply:
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 19 --full-reparse --confirm-season 19 \
+  --workspace /home/csc-core/core-docker/demos/round-repair-work \
+  --api-path-root /demos/round-repair-work
+```
+
+Before running this against a season with live traffic, confirm CSC-Stats'
+core-identity mirror is fresh (add-match fails closed with a 503 if it's stale
+by more than 26h) — a season-length run will otherwise burn archive-download
+egress only to 503 on every write.
