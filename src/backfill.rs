@@ -912,14 +912,30 @@ fn parse_s3_keys(value: Option<&Value>) -> Result<Vec<String>> {
     }
 }
 
-/// Builds and validates the CDN URL for an `s3_keys` object key. Keys are
-/// bare object paths (e.g. `s20/M10/....dem.zip`) with no scheme or leading
-/// slash; a key containing either is rejected rather than joined, so an
-/// absolute/foreign value in the array can never redirect the download off
-/// the allowlisted CDN host.
+/// Builds and validates the CDN URL for an `s3_keys` entry. Most entries are
+/// bare object paths (e.g. `s20/M10/....dem.zip`) with no scheme, which get
+/// joined onto the DigitalOcean CDN host. But CSC-Core's Match admin lets
+/// tech/admin ops directly edit a match's per-map demo URLs to correct a bad
+/// entry (`apps/matches/admin.py::MatchAdminForm.clean_map_demo_urls`), and
+/// its save path (`apps/matches/demo_artifacts.py::s3_key_from_url`) stores
+/// whatever the admin pasted back verbatim whenever it isn't already
+/// DO-CDN-prefixed — including a migrated Backblaze URL, or any other
+/// allowlisted CSC archive host. Rejecting every absolute entry outright
+/// would fail URL conversion for exactly the corrected matches this s3_keys
+/// path exists to fix, silently falling back to the legacy demo_url and
+/// recreating the original truncation. So an entry containing a scheme is
+/// instead run through the same host/scheme/extension allowlist as
+/// `demo_url` itself (`validate_archive_url_labeled`) rather than being
+/// joined — that still refuses to redirect the download off an allowlisted
+/// CSC archive host, it just also accepts a non-DO one. A bare leading-slash
+/// value (neither a scheme-qualified URL nor a joinable relative key) stays
+/// rejected.
 fn s3_key_to_url(key: &str) -> Result<Url> {
-    if key.contains("://") || key.starts_with('/') {
-        bail!("s3_keys entry is not a bare object key: {key}");
+    if key.contains("://") {
+        return validate_archive_url_labeled(key, "s3_keys entry");
+    }
+    if key.starts_with('/') {
+        bail!("s3_keys entry is not a bare object key or an absolute URL: {key}");
     }
     let raw = format!("https://{S3_KEYS_CDN_HOST}/{key}");
     validate_archive_url_labeled(&raw, "s3_keys entry")
@@ -3154,15 +3170,44 @@ mod tests {
     }
 
     #[test]
-    fn s3_key_to_url_builds_the_do_cdn_url_and_rejects_absolute_or_foreign_keys() {
+    fn s3_key_to_url_builds_the_do_cdn_url_for_a_bare_key() {
         let url =
             s3_key_to_url("s20/M10/s20-M10-Demons-vs-Foo-mid9077-0_de_anubis.dem.zip").unwrap();
         assert_eq!(
             url.as_str(),
             "https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s20/M10/s20-M10-Demons-vs-Foo-mid9077-0_de_anubis.dem.zip"
         );
-        assert!(s3_key_to_url("/absolute/key.dem.zip").is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_accepts_an_allowlisted_absolute_url_from_an_admin_correction() {
+        // CSC-Core's Match admin lets ops paste a corrected demo URL directly
+        // into s3_keys (e.g. a migrated Backblaze URL); it's stored verbatim,
+        // not re-relativized to a DO CDN key. This must not be rejected —
+        // that would fail the s3_keys path and fall back to the legacy
+        // demo_url, recreating the truncation this path exists to fix.
+        let url = s3_key_to_url(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s20/M10/corrected.dem.zip",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s20/M10/corrected.dem.zip"
+        );
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_absolute_urls_off_the_csc_archive_allowlist() {
         assert!(s3_key_to_url("https://attacker.example/key.dem.zip").is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_a_bare_leading_slash_value() {
+        assert!(s3_key_to_url("/absolute/key.dem.zip").is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_a_non_archive_extension() {
         assert!(s3_key_to_url("s20/M10/not-an-archive.txt").is_err());
     }
 
