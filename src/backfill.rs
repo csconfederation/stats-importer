@@ -1766,16 +1766,26 @@ async fn process_match(
         ))?;
         return Ok(());
     }
-    // --full-reparse only: prefer the canonical per-map s3_keys array over
-    // the legacy single-map demo_url when it is present *and* validates
-    // cleanly against Core's scored maps. This is gated to full-reparse
-    // because round-repair's reviewed-ledger/idempotency-key machinery
-    // (ReviewedInventory.archive_checksums, repair_request's v3 idempotency
-    // key) is keyed on exactly one archive per match; extending it to N
-    // archives would need a reviewed-ledger schema change and invalidate
-    // every previously-reviewed ledger. full-reparse has no such
+    // --full-reparse only, and BO3 only: prefer the canonical per-map
+    // s3_keys array over the legacy single-map demo_url when it is present
+    // *and* validates cleanly against Core's scored maps. This is gated to
+    // full-reparse because round-repair's reviewed-ledger/idempotency-key
+    // machinery (ReviewedInventory.archive_checksums, repair_request's v3
+    // idempotency key) is keyed on exactly one archive per match; extending
+    // it to N archives would need a reviewed-ledger schema change and
+    // invalidate every previously-reviewed ledger. full-reparse has no such
     // attestation flow (add-match reparses are safe to rerun), so it can
     // take the multi-archive path safely.
+    //
+    // It is also gated to is_bo3: CSC-Core populates a one-entry s3_keys
+    // array for BO1s too, but discover_single_map_demo always builds
+    // stats_match_id as `{match_id}_{map_index}` — the BO3 suffix
+    // convention. Taking this path for a BO1 would import under the wrong
+    // (suffixed) stats match id, creating a new record while leaving the
+    // real unsuffixed BO1 record stale. BO1s were never truncated by the
+    // original bug (a single demo_url already covers their one map), so
+    // there is nothing for this path to fix there — the legacy demo_url
+    // path below already handles BO1s correctly.
     //
     // s3_keys is not reliably a *complete* per-map array in practice: most
     // season-19 BO3s have a DemoProcessingStatus row whose s3_keys holds
@@ -1784,21 +1794,24 @@ async fn process_match(
     // of season-20 matches have a corrupt count or order (matches 9077 and
     // 9275 — see validate_s3_key_order). Any of those must not turn into a
     // worse outcome than before this code existed, so a validation failure
-    // logs a clear (non-terminal) ledger event and falls through to the
-    // legacy demo_url path below, same as a match with no s3_keys at all.
-    if args.full_reparse {
+    // (including a malformed s3_keys value itself) logs a clear
+    // (non-terminal) ledger event and falls through to the legacy demo_url
+    // path below, same as a match with no s3_keys at all.
+    if args.full_reparse && core_match.is_bo3 {
         let s3_keys = match parse_s3_keys(core_match.s3_keys.as_ref()) {
             Ok(keys) => keys,
             Err(error) => {
                 ledger.append(event(
                     args,
                     core_match.match_id,
-                    "artifact_unsupported",
+                    "s3_keys_mismatch",
                     None,
-                    Some(format!("s3_keys is malformed: {error:#}")),
+                    Some(format!(
+                        "s3_keys is malformed: {error:#}; falling back to the legacy demo_url path for this match"
+                    )),
                     None,
                 ))?;
-                return Ok(());
+                Vec::new()
             }
         };
         if !s3_keys.is_empty() {
@@ -2476,11 +2489,17 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         );
     }
     if let Some(inventory) = &reviewed_inventory {
-        let required_review = if selected.is_empty() {
-            &available
-        } else {
-            &selected
-        };
+        // Must match the same is_selected() filter the processing loop below
+        // uses, not the full unfiltered `available` set — otherwise a
+        // filtered dry run (e.g. --bo3-only with no --match-id) never
+        // produces terminal ledger entries for the matches it skipped, and
+        // this check would then demand review coverage the dry run never
+        // could have produced, failing every apply run before it starts.
+        let required_review: HashSet<i64> = matches
+            .iter()
+            .filter(|item| is_selected(item, args.bo3_only, &selected))
+            .map(|item| item.match_id)
+            .collect();
         let missing_review = required_review
             .difference(&inventory.terminal_matches)
             .copied()
