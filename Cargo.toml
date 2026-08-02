@@ -13,7 +13,7 @@ zip = "0.6.4"
 regex = "*"
 anyhow = "1.0.69"
 thiserror = "1.0.38"
-sqlx = { version = "0.8.6", features = [ "runtime-tokio-rustls", "postgres", "macros"] }
+sqlx = { version = "0.8.6", features = [ "runtime-tokio-rustls", "postgres", "macros", "json"] }
 tokio = { version= "1.25.0", features = ["full"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
 serde = { version = "1.0.152", features = ["derive"] }
