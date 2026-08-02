@@ -201,12 +201,40 @@ never backfills the fragg-3.0 eco/swing columns (`Match.ecoStatsOK`,
 `PlayerMatchStats.swing_rating`/`eco*`) onto historical matches — those live on
 the match-level row. To get eco stats (or any other add-match-ingest-side fix)
 onto historical matches, use `--full-reparse` instead: it reuses the same
-season inventory, archive download, and demo discovery as round-repair, but
-POSTs every discovered demo through the normal `/api/add-match` ingest path
-with `createOnly: false` rather than `/api/repair-round-stats`. CSC-Stats
-deletes and recreates the match transactionally (parse happens before the
-delete, so a parser failure never destroys existing data), so this is safe to
-rerun.
+season inventory and demo discovery as round-repair, but POSTs every
+discovered demo through the normal `/api/add-match` ingest path with
+`createOnly: false` rather than `/api/repair-round-stats`. CSC-Stats deletes
+and recreates the match transactionally (parse happens before the delete, so
+a parser failure never destroys existing data), so this is safe to rerun.
+
+For season-20+ BO3s, `--full-reparse` prefers
+`matches_demoprocessingstatus.s3_keys` (the canonical per-map upload order)
+over the legacy `matches_matches.demo_url` column, which only ever points at
+map 1's archive. Each key is downloaded and extracted as its own archive; the
+key's position in the array — not any digit embedded in its filename, which
+is known to repeat across different maps in some matches — is the map
+order. The resulting `statsMatchId` uses that zero-based array position
+(`{coreMatchId}_0`, `_1`, ...), matching CSC-Stats' own per-map numbering
+convention as observed on live-ingested historical matches; it is not Core's
+1-based `matches_matchstats.map_number`.
+
+Before downloading anything, `s3_keys` is validated against Core's scored
+maps (`matches_matchstats` rows with a real result, excluding the
+unplayed-placeholder row a BO3 gets for a map it never reached) on both
+count and order — each key must contain its position's map name. In
+practice `s3_keys` is not reliably a *complete* per-map array: most
+season-19 BO3s have a `DemoProcessingStatus` row whose `s3_keys` holds just
+one key (a single per-map upload alongside the real bundled archive at
+`demo_url`) even though multiple maps were played, and a handful of
+season-20 matches have a corrupt count (a duplicate upload from a mid-match
+restart) or order (same count, keys out of sequence). A validation failure
+logs a clear `s3_keys_mismatch` ledger event and falls back to the legacy
+single-`demo_url` path for that match — the same path used for BO1s and for
+matches with no `s3_keys` row at all — rather than guessing or regressing a
+match that already reparses correctly today. This `s3_keys` path is
+full-reparse only — round-repair's reviewed-ledger/idempotency machinery is
+keyed on one archive per match, so BO3 round-repair on season-20+ matches
+remains a known follow-up.
 
 `--full-reparse` has no round-level fingerprint/checksum review flow and no
 `--parser-version` requirement (add-match has no parser-version attestation
@@ -239,6 +267,21 @@ core-identity mirror is fresh (add-match fails closed with a 503 if it's stale
 by more than 26h) — a season-length run will otherwise burn archive-download
 egress only to 503 on every write.
 
+`--bo3-only` restricts the season inventory to `is_bo3 = true` matches,
+skipping BO1s. It is a match-selection filter, not a mode — it composes with
+`--match-id`, `--full-reparse`, `--apply`, `--direct-apply`, and dry-run the
+same way `--match-id` does, rather than being mutually exclusive with any of
+them (with one exception — see `--combines` below). Useful for validating the
+s3_keys multi-map path (or any other BO3-specific change) against just a
+season's BO3s instead of reparsing every BO1 too:
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 20 --full-reparse --bo3-only \
+  --workspace /home/csc-core/core-docker/demos/round-repair-work \
+  --api-path-root /demos/round-repair-work
+```
+
 ## Combine reparse
 
 `--combines` reparses a season's combine matches (`matches_combinematches`)
@@ -261,7 +304,11 @@ downloaded and failed at apply time.
 
 `--combines` is mutually exclusive with `--full-reparse` and the round-repair
 modes (`--apply`/`--direct-apply`) — it selects the match source, not an
-additional mode on top of them. It shares `--full-reparse`'s ledger/mode
+additional mode on top of them. It is also mutually exclusive with
+`--bo3-only`: `combine_season_matches()` always synthesizes `is_bo3: false`
+for the matches it returns, so `--bo3-only --combines` would silently filter
+out every combine and produce an empty, confusing run — the CLI rejects the
+combination outright instead. It shares `--full-reparse`'s ledger/mode
 semantics (no `--parser-version` requirement, dry-run until
 `--confirm-season` is supplied, resumable via the same JSONL ledger), but
 under distinct `combines-full-reparse`/`combines-full-reparse-dry-run` mode
