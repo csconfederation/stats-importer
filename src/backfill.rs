@@ -54,21 +54,38 @@ pub struct BackfillArgs {
     /// round-repair path's dry-run/apply review gate.
     #[arg(
         long,
-        conflicts_with_all = ["apply", "direct_apply", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256"]
+        conflicts_with_all = ["apply", "direct_apply", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256", "combines"]
     )]
     full_reparse: bool,
 
-    /// Required with --apply, --direct-apply, or --full-reparse to make writes explicit.
+    /// Reparse a season's combine matches (matches_combinematches) instead of
+    /// league matches (matches_matches). Combines have no round-repair concept
+    /// (no per-round stat correction target) and are always a single map, so
+    /// this always behaves like --full-reparse: it downloads/discovers demos
+    /// and, once --confirm-season is supplied, reparses them through the same
+    /// add-match ingest path used for league matches, with the resulting
+    /// stats match id prefixed `combines-{id}` so CSC-Stats' add-match handler
+    /// treats it as a combine import. Combine matches have no season foreign
+    /// key in Core's schema, so season scoping is inferred from the `sNN/`
+    /// path segment CSC's demo archival tooling puts in demo_url.
+    #[arg(
+        long,
+        conflicts_with_all = ["apply", "direct_apply", "full_reparse", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256"]
+    )]
+    combines: bool,
+
+    /// Required with --apply, --direct-apply, --full-reparse, or --combines to make writes explicit.
     #[arg(long)]
     confirm_season: Option<i32>,
 
     /// Version/profile configured by CSC-Stats for the pinned parser. Required for
-    /// round-repair modes; unused (and not required) by --full-reparse, which has
-    /// no parser-version attestation concept on the add-match endpoint.
+    /// round-repair modes; unused (and not required) by --full-reparse or
+    /// --combines, neither of which has a parser-version attestation concept
+    /// on the add-match endpoint.
     #[arg(
         long,
         env = "STATS_REPAIR_PARSER_VERSION",
-        required_unless_present = "full_reparse"
+        required_unless_present_any = ["full_reparse", "combines"]
     )]
     parser_version: Option<String>,
 
@@ -245,7 +262,9 @@ struct CachedSourceInventory {
 
 impl BackfillArgs {
     fn writes(&self) -> bool {
-        self.apply || self.direct_apply || (self.full_reparse && self.confirm_season.is_some())
+        self.apply
+            || self.direct_apply
+            || ((self.full_reparse || self.combines) && self.confirm_season.is_some())
     }
 
     fn mode(&self) -> &'static str {
@@ -253,6 +272,15 @@ impl BackfillArgs {
             "direct-apply"
         } else if self.apply {
             "apply"
+        } else if self.combines {
+            // Distinct mode strings keep combine ledger/workspace bookkeeping
+            // out of the league-match id space; matches_combinematches.id and
+            // matches_matches.id are independent sequences that can collide.
+            if self.confirm_season.is_some() {
+                "combines-full-reparse"
+            } else {
+                "combines-full-reparse-dry-run"
+            }
         } else if self.full_reparse {
             if self.confirm_season.is_some() {
                 "full-reparse"
@@ -689,6 +717,75 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
     Ok(rows)
 }
 
+#[derive(Debug, FromRow, Clone)]
+struct CombineMatchRow {
+    match_id: i64,
+    demo_url: Option<String>,
+    tier: Option<String>,
+    match_date: String,
+}
+
+/// Fetches a season's combine matches (matches_combinematches), shaped as
+/// CoreMatch so the rest of the reparse pipeline (discover_demos,
+/// process_match, the Ledger) can be reused unchanged. Combines have no
+/// BO3/round-repair concept: every combine is a single map, so is_bo3 is
+/// always false, map_count is always 1, and the forfeit/audit flags (which
+/// only gate the round-repair path, never taken for combines) are always
+/// false.
+///
+/// matches_combinematches has no season foreign key the way matches_matches
+/// has via leagues_matchday -> leagues_seasons, so season scoping can't be a
+/// SQL join. CSC's demo archival tooling embeds the season as an `sNN/` path
+/// segment in demo_url (verified against prod-mirrored data: every archived
+/// combine and league match demo_url carries this segment), so that's what
+/// this query filters on. The regex requires a trailing `/` after the season
+/// number so season 1 cannot match season 10-19's `s1N/` prefix.
+///
+/// tier_id is nullable on matches_combinematches (unlike a league match's
+/// tier, which is always derivable from its teams), so this is an inner join:
+/// a combine without a tier can't be reparsed (full_import_request's `tier`
+/// is a required add-match field) and would otherwise download/extract an
+/// archive only to fail at apply time. Excluding it here surfaces the gap as
+/// a missing row in the season's discovered match count rather than a
+/// mid-run failure.
+async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
+    let rows = sqlx::query_as::<_, CombineMatchRow>(
+        r#"
+        SELECT mm.id AS match_id,
+               mm.demo_url,
+               pt.name AS tier,
+               to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date
+        FROM matches_combinematches mm
+        JOIN players_tiers pt ON pt.id = mm.tier_id
+        WHERE mm.cancelled = false
+          AND mm.game_finished = true
+          AND mm.demo_url IS NOT NULL
+          AND mm.demo_url ~ ('/s' || $1::text || '/')
+        ORDER BY mm.scheduled_date, mm.id
+        "#,
+    )
+    .bind(season)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| CoreMatch {
+            match_id: row.match_id,
+            is_bo3: false,
+            demo_url: row.demo_url,
+            map_count: 1,
+            played_map_numbers: vec![1],
+            match_day: String::new(),
+            match_date: row.match_date,
+            tier: row.tier,
+            marked_forfeit: false,
+            legacy_one_zero: false,
+            has_forfeit_audit: false,
+        })
+        .collect())
+}
+
 fn validate_archive_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).context("invalid demo_url")?;
     let host = url.host_str();
@@ -1117,6 +1214,31 @@ async fn repair_request(
     Ok(value)
 }
 
+/// Computes the add-match `matchId`/`matchType` for a discovered demo. For
+/// combines this applies the `combines-{id}` prefix that CSC-Stats'
+/// `handle-add-match.ts` expects to distinguish combine imports from league
+/// match imports (the same convention main.rs's single-file import path
+/// already applies), and a "Combine" matchType distinct from
+/// Regulation/Playoff.
+fn full_import_identity(
+    args: &BackfillArgs,
+    core_match: &CoreMatch,
+    stats_match_id: &str,
+) -> (String, &'static str) {
+    if args.combines {
+        (format!("combines-{stats_match_id}"), "Combine")
+    } else {
+        (
+            stats_match_id.to_owned(),
+            if core_match.is_bo3 {
+                "Playoff"
+            } else {
+                "Regulation"
+            },
+        )
+    }
+}
+
 async fn full_import_request(
     client: &Client,
     args: &BackfillArgs,
@@ -1129,18 +1251,19 @@ async fn full_import_request(
     let tier = core_match
         .tier
         .as_deref()
-        .ok_or_else(|| anyhow!("Core match {} has no team tier", core_match.match_id))?;
+        .ok_or_else(|| anyhow!("Core match {} has no tier", core_match.match_id))?;
+    let (match_id, match_type) = full_import_identity(args, core_match, &demo.stats_match_id);
     let body = json!({
         "path": api_path(args, &demo.path)?,
-        "matchId": demo.stats_match_id,
+        "matchId": match_id,
         "matchDay": core_match.match_day,
-        "matchType": if core_match.is_bo3 { "Playoff" } else { "Regulation" },
+        "matchType": match_type,
         "matchDate": core_match.match_date,
         "season": args.season,
         "tier": tier,
         "traceId": format!(
             "historical-recovery-s{}-core{}-stats{}",
-            args.season, core_match.match_id, demo.stats_match_id
+            args.season, core_match.match_id, match_id
         ),
         "createOnly": create_only,
         "fixCoreScores": false,
@@ -1245,10 +1368,18 @@ async fn process_match(
             return Ok(());
         }
     };
+    // matches_combinematches.id and matches_matches.id are independent
+    // sequences and can collide numerically; the "combines-" prefix keeps
+    // per-match workspace/archive-cache directories from colliding when a
+    // combine and a league match in the same season share a raw id.
     let match_root = args
         .workspace
         .join(format!("s{}", args.season))
-        .join(core_match.match_id.to_string());
+        .join(if args.combines {
+            format!("combines-{}", core_match.match_id)
+        } else {
+            core_match.match_id.to_string()
+        });
     fs::create_dir_all(&match_root)?;
     let attempt_name = format!(
         "attempt-{}-{}",
@@ -1371,7 +1502,7 @@ async fn process_match(
         ))?;
     }
 
-    if args.full_reparse {
+    if args.full_reparse || args.combines {
         if demos.is_empty() {
             ledger.append(event(
                 args,
@@ -1758,12 +1889,14 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     if args.writes() && args.confirm_season != Some(args.season) {
         bail!(
-            "--apply, --direct-apply, and --full-reparse require --confirm-season {}",
+            "--apply, --direct-apply, --full-reparse, and --combines require --confirm-season {}",
             args.season
         );
     }
     if !args.writes() && args.confirm_season.is_some() {
-        bail!("--confirm-season is only valid with --apply, --direct-apply, or --full-reparse");
+        bail!(
+            "--confirm-season is only valid with --apply, --direct-apply, --full-reparse, or --combines"
+        );
     }
     let reviewed_inventory = ReviewedInventory::load(&args)?;
     let cached_source_inventory = CachedSourceInventory::load(&args)?;
@@ -1805,7 +1938,11 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         .build()?;
     let mode = args.mode();
     let selected: HashSet<i64> = args.match_id.iter().copied().collect();
-    let matches = season_matches(&pool, args.season).await?;
+    let matches = if args.combines {
+        combine_season_matches(&pool, args.season).await?
+    } else {
+        season_matches(&pool, args.season).await?
+    };
     let available: HashSet<i64> = matches.iter().map(|item| item.match_id).collect();
     let mut missing_selected = selected.difference(&available).copied().collect::<Vec<_>>();
     missing_selected.sort_unstable();
@@ -1948,6 +2085,7 @@ mod tests {
             apply: false,
             direct_apply: false,
             full_reparse: false,
+            combines: false,
             confirm_season: None,
             parser_version: Some("test-parser".to_owned()),
             workspace: workspace.to_path_buf(),
@@ -2080,6 +2218,133 @@ mod tests {
                 "/round-repair-work",
             ])
             .is_err());
+    }
+
+    #[test]
+    fn combines_does_not_require_parser_version_and_defaults_to_dry_run() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.parser_version.is_none());
+        assert!(!args.writes());
+        assert_eq!(args.mode(), "combines-full-reparse-dry-run");
+    }
+
+    #[test]
+    fn combines_writes_only_once_confirm_season_is_supplied() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--confirm-season",
+                "12",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.writes());
+        assert_eq!(args.mode(), "combines-full-reparse");
+    }
+
+    #[test]
+    fn combines_conflicts_with_full_reparse_and_round_repair_modes() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--full-reparse",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--apply",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--direct-apply",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn combines_ledger_mode_is_distinct_from_league_full_reparse_mode() {
+        // The ledger dedups on (season, mode, match_id), and
+        // matches_combinematches.id / matches_matches.id are independent
+        // sequences that can numerically collide within the same season.
+        // Distinct mode strings keep a combine run from being mistaken for
+        // (or masking) a league-match run that happens to share an id.
+        let root = test_path("combines-mode");
+        let mut combines_args = backfill_args(&root);
+        combines_args.combines = true;
+        combines_args.full_reparse = false;
+        let mut league_args = backfill_args(&root);
+        league_args.full_reparse = true;
+        assert_ne!(combines_args.mode(), league_args.mode());
+        assert_eq!(combines_args.mode(), "combines-full-reparse-dry-run");
+        assert_eq!(league_args.mode(), "full-reparse-dry-run");
+    }
+
+    #[test]
+    fn full_import_identity_prefixes_combine_match_ids_and_uses_combine_match_type() {
+        let root = test_path("full-import-identity");
+        let mut combines_args = backfill_args(&root);
+        combines_args.combines = true;
+        let combine_core_match = core_match(8440, false);
+        let (match_id, match_type) =
+            full_import_identity(&combines_args, &combine_core_match, "8440");
+        assert_eq!(match_id, "combines-8440");
+        assert_eq!(match_type, "Combine");
+
+        // Even if a combine's CoreMatch were mistakenly marked is_bo3 (it
+        // never is in practice: combines are always single-map), --combines
+        // should still win and report "Combine", not "Playoff".
+        let miscoded = core_match(8440, true);
+        let (_, match_type) = full_import_identity(&combines_args, &miscoded, "8440");
+        assert_eq!(match_type, "Combine");
+
+        let league_args = backfill_args(&root);
+        let bo1 = core_match(500, false);
+        let (match_id, match_type) = full_import_identity(&league_args, &bo1, "500");
+        assert_eq!(match_id, "500");
+        assert_eq!(match_type, "Regulation");
+
+        let bo3 = core_match(501, true);
+        let (match_id, match_type) = full_import_identity(&league_args, &bo3, "501_1");
+        assert_eq!(match_id, "501_1");
+        assert_eq!(match_type, "Playoff");
     }
 
     #[test]

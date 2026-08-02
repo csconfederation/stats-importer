@@ -238,3 +238,52 @@ Before running this against a season with live traffic, confirm CSC-Stats'
 core-identity mirror is fresh (add-match fails closed with a 503 if it's stale
 by more than 26h) — a season-length run will otherwise burn archive-download
 egress only to 503 on every write.
+
+## Combine reparse
+
+`--combines` reparses a season's combine matches (`matches_combinematches`)
+instead of league matches. Combines have no round-repair concept (there's no
+per-round `PlayerMatchStats` correction target) and are always a single map,
+so `--combines` behaves like `--full-reparse` — same download/discover/ledger
+machinery, same `/api/add-match` ingest call with `createOnly: false` once
+`--confirm-season` is supplied — just sourced from the combine table. It sends
+`matchType: "Combine"` and prefixes the Stats match id `combines-{id}`, which
+is what CSC-Stats' add-match handler and `stats-importer`'s own single-file
+import mode already use to keep combine imports out of the league-match id
+space.
+
+`matches_combinematches` has no season foreign key (no `leagues_matchday` /
+`leagues_seasons` join is possible), so season scoping comes from the `sNN/`
+path segment CSC's demo archival tooling puts in `demo_url` instead. A
+combine with no tier assigned (`tier_id` is nullable, unlike a league match's
+derivable-from-teams tier) is excluded from the season inventory rather than
+downloaded and failed at apply time.
+
+`--combines` is mutually exclusive with `--full-reparse` and the round-repair
+modes (`--apply`/`--direct-apply`) — it selects the match source, not an
+additional mode on top of them. It shares `--full-reparse`'s ledger/mode
+semantics (no `--parser-version` requirement, dry-run until
+`--confirm-season` is supplied, resumable via the same JSONL ledger), but
+under distinct `combines-full-reparse`/`combines-full-reparse-dry-run` mode
+strings — `matches_combinematches.id` and `matches_matches.id` are
+independent sequences that can share a numeric id within the same season, and
+the distinct mode string keeps a combine run's ledger/workspace bookkeeping
+from colliding with a league-match run's.
+
+Dry-run:
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 20 --combines \
+  --workspace /home/csc-core/core-docker/demos/round-repair-work \
+  --api-path-root /demos/round-repair-work
+```
+
+Apply:
+
+```bash
+scripts/run-backfill-nice.sh \
+  --season 20 --combines --confirm-season 20 \
+  --workspace /home/csc-core/core-docker/demos/round-repair-work \
+  --api-path-root /demos/round-repair-work
+```
