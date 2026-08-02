@@ -54,21 +54,38 @@ pub struct BackfillArgs {
     /// round-repair path's dry-run/apply review gate.
     #[arg(
         long,
-        conflicts_with_all = ["apply", "direct_apply", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256"]
+        conflicts_with_all = ["apply", "direct_apply", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256", "combines"]
     )]
     full_reparse: bool,
 
-    /// Required with --apply, --direct-apply, or --full-reparse to make writes explicit.
+    /// Reparse a season's combine matches (matches_combinematches) instead of
+    /// league matches (matches_matches). Combines have no round-repair concept
+    /// (no per-round stat correction target) and are always a single map, so
+    /// this always behaves like --full-reparse: it downloads/discovers demos
+    /// and, once --confirm-season is supplied, reparses them through the same
+    /// add-match ingest path used for league matches, with the resulting
+    /// stats match id prefixed `combines-{id}` so CSC-Stats' add-match handler
+    /// treats it as a combine import. Combine matches have no season foreign
+    /// key in Core's schema, so season scoping is inferred from the `sNN/`
+    /// path segment CSC's demo archival tooling puts in demo_url.
+    #[arg(
+        long,
+        conflicts_with_all = ["apply", "direct_apply", "full_reparse", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256", "bo3_only"]
+    )]
+    combines: bool,
+
+    /// Required with --apply, --direct-apply, --full-reparse, or --combines to make writes explicit.
     #[arg(long)]
     confirm_season: Option<i32>,
 
     /// Version/profile configured by CSC-Stats for the pinned parser. Required for
-    /// round-repair modes; unused (and not required) by --full-reparse, which has
-    /// no parser-version attestation concept on the add-match endpoint.
+    /// round-repair modes; unused (and not required) by --full-reparse or
+    /// --combines, neither of which has a parser-version attestation concept
+    /// on the add-match endpoint.
     #[arg(
         long,
         env = "STATS_REPAIR_PARSER_VERSION",
-        required_unless_present = "full_reparse"
+        required_unless_present_any = ["full_reparse", "combines"]
     )]
     parser_version: Option<String>,
 
@@ -116,6 +133,18 @@ pub struct BackfillArgs {
     #[arg(long)]
     match_id: Vec<i64>,
 
+    /// Restrict the season inventory to BO3 matches only (is_bo3 = true),
+    /// skipping BO1s. A match-selection filter, not a mode: it composes
+    /// with --full-reparse/--apply/--direct-apply/dry-run the same way
+    /// --match-id does, rather than being mutually exclusive with them.
+    /// Useful for validating a BO3-specific fix (e.g. the s3_keys
+    /// multi-map path) without reparsing an entire season's BO1s too.
+    /// Mutually exclusive with --combines: combine matches are always
+    /// synthesized with is_bo3 = false, so --bo3-only would silently
+    /// filter out every combine and produce an empty run.
+    #[arg(long, conflicts_with = "combines")]
+    bo3_only: bool,
+
     /// Keep successful per-match workspaces instead of deleting them.
     #[arg(long, conflicts_with = "keep_all")]
     keep_successful: bool,
@@ -150,6 +179,20 @@ struct CoreMatch {
     marked_forfeit: bool,
     legacy_one_zero: bool,
     has_forfeit_audit: bool,
+    // Map names, in played (map_number) order, for the maps that were
+    // actually played (excludes the unplayed-placeholder matches_matchstats
+    // row a BO3 gets for a map it never reached, e.g. a 2-0 sweep's map 3).
+    // Used only to validate the s3_keys match-count/order gate below; it is
+    // NOT a substitute for played_map_numbers in the legacy discover_demos
+    // path, which intentionally still counts placeholder rows.
+    scored_map_names: Vec<String>,
+    // Canonical per-map upload order from matches_demoprocessingstatus.s3_keys
+    // (a JSONB array of S3 object keys, index 0 = map 1, ...). This is the
+    // source of truth for BO3 map order on season-20+ matches; the legacy
+    // matches_matches.demo_url column only ever points at map 1's archive.
+    // Absent (NULL/empty) for BO1s and for matches that predate per-map
+    // uploads (those got a single bundled archive at demo_url instead).
+    s3_keys: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +288,9 @@ struct CachedSourceInventory {
 
 impl BackfillArgs {
     fn writes(&self) -> bool {
-        self.apply || self.direct_apply || (self.full_reparse && self.confirm_season.is_some())
+        self.apply
+            || self.direct_apply
+            || ((self.full_reparse || self.combines) && self.confirm_season.is_some())
     }
 
     fn mode(&self) -> &'static str {
@@ -253,6 +298,15 @@ impl BackfillArgs {
             "direct-apply"
         } else if self.apply {
             "apply"
+        } else if self.combines {
+            // Distinct mode strings keep combine ledger/workspace bookkeeping
+            // out of the league-match id space; matches_combinematches.id and
+            // matches_matches.id are independent sequences that can collide.
+            if self.confirm_season.is_some() {
+                "combines-full-reparse"
+            } else {
+                "combines-full-reparse-dry-run"
+            }
         } else if self.full_reparse {
             if self.confirm_season.is_some() {
                 "full-reparse"
@@ -638,6 +692,21 @@ fn canonical_output_path(path: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
+/// Whether a Core match should be processed this run, given the two
+/// orthogonal match-selection filters: `--bo3-only` (skip BO1s) and
+/// `--match-id` (process only the named matches, repeatable; empty means
+/// "no restriction"). Both apply together — a match must satisfy every
+/// active filter, not just one.
+fn is_selected(core_match: &CoreMatch, bo3_only: bool, selected: &HashSet<i64>) -> bool {
+    if bo3_only && !core_match.is_bo3 {
+        return false;
+    }
+    if !selected.is_empty() && !selected.contains(&core_match.match_id) {
+        return false;
+    }
+    true
+}
+
 async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
     let rows = sqlx::query_as::<_, CoreMatch>(
         r#"
@@ -650,7 +719,27 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                    regexp_replace(coalesce(ms.score, ''), '\s+', '', 'g') IN ('1-0', '0-1')
                  ) AS legacy_one_zero,
                  count(DISTINCT ms.map_number)::bigint AS map_count,
-                 array_agg(DISTINCT ms.map_number ORDER BY ms.map_number) AS played_map_numbers
+                 array_agg(DISTINCT ms.map_number ORDER BY ms.map_number) AS played_map_numbers,
+                 -- BO3s get a placeholder matches_matchstats row for map 3
+                 -- created up front even when the series ends 2-0 and map 3
+                 -- is never played (home_score=away_score=0, winner_id
+                 -- NULL). map_count/played_map_numbers above intentionally
+                 -- still include it (existing legacy-path consumers rely on
+                 -- the raw count); this filtered pair is for the s3_keys
+                 -- match-count gate only, which must not be fooled by an
+                 -- unplayed placeholder into flagging a clean 2-map s3_keys
+                 -- array as a mismatch (Core-planning#242 item 3). A
+                 -- handful of old matches have a real score but a
+                 -- never-backfilled null winner_id, so "played" is
+                 -- winner_id set OR either score non-zero, not winner_id
+                 -- alone.
+                 -- map_name is nullable; coalesce so a NULL never lands in
+                 -- the aggregate (sqlx errors decoding a NULL element into
+                 -- Vec<String>, which would take down the whole season
+                 -- query, not just one match).
+                 array_agg(coalesce(ms.map_name, '') ORDER BY ms.map_number) FILTER (
+                   WHERE ms.winner_id IS NOT NULL OR ms.home_score <> 0 OR ms.away_score <> 0
+                 ) AS scored_map_names
           FROM matches_matchstats ms
           GROUP BY ms.match_id
         ), audit_flags AS (
@@ -669,7 +758,9 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(home_tier.name, away_tier.name) AS tier,
                coalesce(sf.marked_forfeit, false) AS marked_forfeit,
                coalesce(sf.legacy_one_zero, false) AS legacy_one_zero,
-               coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit
+               coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit,
+               coalesce(sf.scored_map_names, ARRAY[]::text[]) AS scored_map_names,
+               dps.s3_keys AS s3_keys
         FROM matches_matches m
         JOIN leagues_matchday md ON md.id = m.match_day_id
         JOIN leagues_seasons s ON s.id = md.season_id
@@ -679,6 +770,7 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
         LEFT JOIN players_tiers away_tier ON away_tier.id = away_team.tier_id
         LEFT JOIN stat_flags sf ON sf.match_id = m.id
         LEFT JOIN audit_flags af ON af.match_id = m.id
+        LEFT JOIN matches_demoprocessingstatus dps ON dps.match_id = m.id
         WHERE s.number = $1
         ORDER BY md.scheduled_date, m.id
         "#,
@@ -689,8 +781,88 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
     Ok(rows)
 }
 
+#[derive(Debug, FromRow, Clone)]
+struct CombineMatchRow {
+    match_id: i64,
+    demo_url: Option<String>,
+    tier: Option<String>,
+    match_date: String,
+}
+
+/// Fetches a season's combine matches (matches_combinematches), shaped as
+/// CoreMatch so the rest of the reparse pipeline (discover_demos,
+/// process_match, the Ledger) can be reused unchanged. Combines have no
+/// BO3/round-repair concept: every combine is a single map, so is_bo3 is
+/// always false, map_count is always 1, and the forfeit/audit flags (which
+/// only gate the round-repair path, never taken for combines) are always
+/// false.
+///
+/// matches_combinematches has no season foreign key the way matches_matches
+/// has via leagues_matchday -> leagues_seasons, so season scoping can't be a
+/// SQL join. CSC's demo archival tooling embeds the season as an `sNN/` path
+/// segment in demo_url (verified against prod-mirrored data: every archived
+/// combine and league match demo_url carries this segment), so that's what
+/// this query filters on. The regex requires a trailing `/` after the season
+/// number so season 1 cannot match season 10-19's `s1N/` prefix.
+///
+/// tier_id is nullable on matches_combinematches (unlike a league match's
+/// tier, which is always derivable from its teams), so this is an inner join:
+/// a combine without a tier can't be reparsed (full_import_request's `tier`
+/// is a required add-match field) and would otherwise download/extract an
+/// archive only to fail at apply time. Excluding it here surfaces the gap as
+/// a missing row in the season's discovered match count rather than a
+/// mid-run failure.
+async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
+    let rows = sqlx::query_as::<_, CombineMatchRow>(
+        r#"
+        SELECT mm.id AS match_id,
+               mm.demo_url,
+               pt.name AS tier,
+               to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date
+        FROM matches_combinematches mm
+        JOIN players_tiers pt ON pt.id = mm.tier_id
+        WHERE mm.cancelled = false
+          AND mm.game_finished = true
+          AND mm.demo_url IS NOT NULL
+          AND mm.demo_url ~ ('/s' || $1::text || '/')
+        ORDER BY mm.scheduled_date, mm.id
+        "#,
+    )
+    .bind(season)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| CoreMatch {
+            match_id: row.match_id,
+            is_bo3: false,
+            demo_url: row.demo_url,
+            map_count: 1,
+            played_map_numbers: vec![1],
+            match_day: String::new(),
+            match_date: row.match_date,
+            tier: row.tier,
+            marked_forfeit: false,
+            legacy_one_zero: false,
+            has_forfeit_audit: false,
+            // Combines have no matches_demoprocessingstatus row (that table
+            // is keyed to matches_matches, not matches_combinematches), so
+            // there is no s3_keys array to consult; combines always go
+            // through the legacy single-demo_url path, consistent with
+            // being single-map.
+            scored_map_names: Vec::new(),
+            s3_keys: None,
+        })
+        .collect())
+}
+
 fn validate_archive_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).context("invalid demo_url")?;
+    validate_archive_url_labeled(raw, "demo_url")
+}
+
+fn validate_archive_url_labeled(raw: &str, label: &str) -> Result<Url> {
+    let url = Url::parse(raw).with_context(|| format!("invalid {label}"))?;
     let host = url.host_str();
     let backblaze = host == Some(B2_HOST) && url.path().starts_with(B2_PATH_PREFIX);
     let legacy_digital_ocean = host.is_some_and(|value| LEGACY_DO_HOSTS.contains(&value));
@@ -700,14 +872,118 @@ fn validate_archive_url(raw: &str) -> Result<Url> {
         || url.password().is_some()
         || url.port().is_some()
     {
-        bail!("demo_url is not an allowlisted CSC archive URL");
+        bail!("{label} is not an allowlisted CSC archive URL");
     }
     if !(url.path().to_ascii_lowercase().ends_with(".7z")
         || url.path().to_ascii_lowercase().ends_with(".zip"))
     {
-        bail!("demo_url is not a .7z/.zip archive");
+        bail!("{label} is not a .7z/.zip archive");
     }
     Ok(url)
+}
+
+/// CDN host that CSC-Core's `apps/matches/demo_artifacts.py::build_demo_url()`
+/// prefixes `matches_demoprocessingstatus.s3_keys` entries with. It is
+/// already present in `LEGACY_DO_HOSTS`.
+const S3_KEYS_CDN_HOST: &str = "cscdemos.nyc3.cdn.digitaloceanspaces.com";
+
+/// Parses the `matches_demoprocessingstatus.s3_keys` JSONB column into an
+/// ordered list of object keys. `None`/JSON `null` and an empty array both
+/// mean "no per-map artifacts recorded" and yield an empty vec (the caller
+/// falls back to the legacy `demo_url` path for those). Any other shape
+/// (non-array, or an array containing a non-string element) is treated as
+/// corrupt data and returns an error rather than silently dropping entries,
+/// since a dropped entry would reintroduce exactly the kind of silent
+/// map-loss this code exists to fix.
+fn parse_s3_keys(value: Option<&Value>) -> Result<Vec<String>> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("s3_keys[{index}] is not a string: {item}"))
+            })
+            .collect(),
+        Some(other) => bail!("s3_keys is not a JSON array: {other}"),
+    }
+}
+
+/// Builds and validates the CDN URL for an `s3_keys` entry. Most entries are
+/// bare object paths (e.g. `s20/M10/....dem.zip`) with no scheme, which get
+/// joined onto the DigitalOcean CDN host. But CSC-Core's Match admin lets
+/// tech/admin ops directly edit a match's per-map demo URLs to correct a bad
+/// entry (`apps/matches/admin.py::MatchAdminForm.clean_map_demo_urls`), and
+/// its save path (`apps/matches/demo_artifacts.py::s3_key_from_url`) stores
+/// whatever the admin pasted back verbatim whenever it isn't already
+/// DO-CDN-prefixed — including a migrated Backblaze URL, or any other
+/// allowlisted CSC archive host. Rejecting every absolute entry outright
+/// would fail URL conversion for exactly the corrected matches this s3_keys
+/// path exists to fix, silently falling back to the legacy demo_url and
+/// recreating the original truncation. So an entry containing a scheme is
+/// instead run through the same host/scheme/extension allowlist as
+/// `demo_url` itself (`validate_archive_url_labeled`) rather than being
+/// joined — that still refuses to redirect the download off an allowlisted
+/// CSC archive host, it just also accepts a non-DO one. A bare leading-slash
+/// value (neither a scheme-qualified URL nor a joinable relative key) stays
+/// rejected.
+fn s3_key_to_url(key: &str) -> Result<Url> {
+    if key.contains("://") {
+        return validate_archive_url_labeled(key, "s3_keys entry");
+    }
+    if key.starts_with('/') {
+        bail!("s3_keys entry is not a bare object key or an absolute URL: {key}");
+    }
+    let raw = format!("https://{S3_KEYS_CDN_HOST}/{key}");
+    validate_archive_url_labeled(&raw, "s3_keys entry")
+}
+
+/// Validates `s3_keys` against Core's `scored_map_names` (the map names of
+/// the maps Core recorded as actually played, in map-number order) on both
+/// count and order:
+///
+/// - **Count**: a length mismatch either way is treated as terminal rather
+///   than guessed at. Too many keys is the known duplicate-upload shape
+///   (e.g. a mid-match restart re-uploading a map, match 9077); too few
+///   would silently mislabel later maps under earlier positions.
+/// - **Order**: count alone cannot catch a same-length reshuffle (match
+///   9275's own real shape: keys `[anubis, anubis, nuke]` against played
+///   maps `[anubis, nuke, nuke]` — 3 and 3, but position 1 disagrees). Each
+///   key must contain its position's map name; a mismatch here is exactly
+///   the class of silent per-map mis-assignment this s3_keys path exists to
+///   prevent, so it is also terminal rather than best-effort.
+fn validate_s3_key_order(s3_keys: &[String], core_match: &CoreMatch) -> Result<()> {
+    if s3_keys.len() != core_match.scored_map_names.len() {
+        bail!(
+            "s3_keys has {} entries but Core records {} scored map(s) ({:?})",
+            s3_keys.len(),
+            core_match.scored_map_names.len(),
+            core_match.scored_map_names,
+        );
+    }
+    for (index, (key, map_name)) in s3_keys
+        .iter()
+        .zip(core_match.scored_map_names.iter())
+        .enumerate()
+    {
+        // map_name is a nullable column coalesced to "" in the query; an
+        // empty needle would make `contains` vacuously true and silently
+        // disable the order check for this position, so treat it as a
+        // mismatch rather than a pass.
+        if map_name.is_empty()
+            || !key
+                .to_ascii_lowercase()
+                .contains(&map_name.to_ascii_lowercase())
+        {
+            bail!(
+                "s3_keys[{index}] ({key}) does not contain Core's map name at that position ({map_name:?})",
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn download_archive(
@@ -1019,6 +1295,86 @@ fn discover_demos(
     Ok(demos)
 }
 
+/// Discovers the single demo inside one `s3_keys`-derived per-map archive.
+/// Map order here comes from the archive's position in the `s3_keys` array
+/// (`map_index`, zero-based), not from any digit in the filename — the
+/// per-map zip filenames embed a `-{N}_` index that is known to repeat
+/// across different maps in some matches (Core-planning#242 item 2) and
+/// must not be used for ordering.
+///
+/// `stats_match_id` is built as `{match_id}_{map_index}`, matching
+/// CSC-Stats' own zero-based per-map numbering convention (confirmed
+/// against real data: e.g. Core match 8336's live-ingested maps are stored
+/// as `8336_0`/`8336_1`, not `8336_1`/`8336_2`) — it is *not* Core's
+/// 1-based `matches_matchstats.map_number`. `core_map_name` is carried
+/// separately, for human-readable messages only.
+///
+/// This function intentionally does not run `discover_demos`'s BO3
+/// suffix/`core_map_order` logic; it keeps only the cross-match
+/// displaced-id guard, which is orthogonal to the unreliable digit and
+/// still catches an archive containing another season match's demo.
+fn discover_single_map_demo(
+    extracted: &Path,
+    core_match: &CoreMatch,
+    map_index: usize,
+    core_map_name: &str,
+    season_match_ids: &HashSet<i64>,
+) -> Result<DemoCandidate> {
+    let embedded_match = Regex::new(r"-mid([0-9]+)-")?;
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(extracted)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("dem") {
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+    let path = match paths.len() {
+        0 => bail!("s3_keys archive for Core map {core_map_name} contains no .dem files"),
+        1 => paths.remove(0),
+        count => bail!(
+            "s3_keys archive for Core map {core_map_name} contains {count} .dem files; expected exactly 1"
+        ),
+    };
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("demo filename is not UTF-8"))?;
+    let embedded_id = embedded_match
+        .captures(filename)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().parse::<i64>())
+        .transpose()?;
+    let displaced_match_id = embedded_id.filter(|value| *value != core_match.match_id);
+    if displaced_match_id.is_some_and(|value| season_match_ids.contains(&value)) {
+        bail!(
+            "s3_keys archive for Core match {} map {} contains demo {} belonging to Core match {} in the same season",
+            core_match.match_id,
+            core_map_name,
+            filename,
+            displaced_match_id.unwrap(),
+        );
+    }
+    Ok(DemoCandidate {
+        checksum: sha256_file(&path)?,
+        relative_path: path.strip_prefix(extracted)?.to_string_lossy().to_string(),
+        path,
+        stats_match_id: format!("{}_{}", core_match.match_id, map_index),
+        identity_source: "s3_keys_array_order".to_owned(),
+        displaced_match_id,
+    })
+}
+
 fn api_path(args: &BackfillArgs, demo: &Path) -> Result<String> {
     let relative = demo
         .strip_prefix(&args.workspace)
@@ -1117,6 +1473,31 @@ async fn repair_request(
     Ok(value)
 }
 
+/// Computes the add-match `matchId`/`matchType` for a discovered demo. For
+/// combines this applies the `combines-{id}` prefix that CSC-Stats'
+/// `handle-add-match.ts` expects to distinguish combine imports from league
+/// match imports (the same convention main.rs's single-file import path
+/// already applies), and a "Combine" matchType distinct from
+/// Regulation/Playoff.
+fn full_import_identity(
+    args: &BackfillArgs,
+    core_match: &CoreMatch,
+    stats_match_id: &str,
+) -> (String, &'static str) {
+    if args.combines {
+        (format!("combines-{stats_match_id}"), "Combine")
+    } else {
+        (
+            stats_match_id.to_owned(),
+            if core_match.is_bo3 {
+                "Playoff"
+            } else {
+                "Regulation"
+            },
+        )
+    }
+}
+
 async fn full_import_request(
     client: &Client,
     args: &BackfillArgs,
@@ -1129,18 +1510,19 @@ async fn full_import_request(
     let tier = core_match
         .tier
         .as_deref()
-        .ok_or_else(|| anyhow!("Core match {} has no team tier", core_match.match_id))?;
+        .ok_or_else(|| anyhow!("Core match {} has no tier", core_match.match_id))?;
+    let (match_id, match_type) = full_import_identity(args, core_match, &demo.stats_match_id);
     let body = json!({
         "path": api_path(args, &demo.path)?,
-        "matchId": demo.stats_match_id,
+        "matchId": match_id,
         "matchDay": core_match.match_day,
-        "matchType": if core_match.is_bo3 { "Playoff" } else { "Regulation" },
+        "matchType": match_type,
         "matchDate": core_match.match_date,
         "season": args.season,
         "tier": tier,
         "traceId": format!(
             "historical-recovery-s{}-core{}-stats{}",
-            args.season, core_match.match_id, demo.stats_match_id
+            args.season, core_match.match_id, match_id
         ),
         "createOnly": create_only,
         "fixCoreScores": false,
@@ -1192,6 +1574,192 @@ fn remove_isolated_directory(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `--full-reparse` path for a match that has a canonical per-map `s3_keys`
+/// array that has already passed `validate_s3_key_order`. Downloads and
+/// extracts each key as its own archive (array position is the map number
+/// — see `discover_single_map_demo`), then feeds every discovered demo
+/// through the same add-match reparse call the legacy single-archive
+/// full-reparse path uses.
+///
+/// Any failure (a download 404 — seen on match 9275 and, for an otherwise
+/// clean and ordered `s3_keys` array, on season-19 match 8334 — or anything
+/// in `inspect_archive`/`extract_archive`/`discover_single_map_demo`) is
+/// propagated as an `Err` rather than continuing with a partial set of
+/// maps, since reparsing a subset is exactly the bug this path exists to
+/// fix. The caller (`process_match`) catches that `Err` and falls back to
+/// the legacy `demo_url` path for the match instead of failing it outright,
+/// since a validated s3_keys array can still point at artifacts that no
+/// longer resolve while the older bundled archive still does.
+async fn process_full_reparse_s3_keys(
+    args: &BackfillArgs,
+    client: &Client,
+    token: &str,
+    ledger: &mut Ledger,
+    core_match: &CoreMatch,
+    season_match_ids: &HashSet<i64>,
+    s3_keys: &[String],
+) -> Result<()> {
+    let match_root = args
+        .workspace
+        .join(format!("s{}", args.season))
+        .join(core_match.match_id.to_string());
+    fs::create_dir_all(&match_root)?;
+    let attempt_name = format!(
+        "attempt-{}-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        std::process::id(),
+    );
+    let match_workspace = match_root.join(attempt_name);
+    fs::create_dir(&match_workspace)?;
+    let mut attempt_workspace =
+        AttemptWorkspace::new(&args.workspace, match_workspace.clone(), args.keep_all);
+
+    let mut demos = Vec::new();
+    let mut archive_evidence = Vec::new();
+    for (map_index, key) in s3_keys.iter().enumerate() {
+        // validate_s3_key_order already proved core_match.scored_map_names
+        // has the same length as s3_keys and that this key contains this
+        // position's map name.
+        let map_name = &core_match.scored_map_names[map_index];
+        // stats_match_id (built inside discover_single_map_demo) uses
+        // map_index — CSC-Stats' own zero-based per-map numbering, matching
+        // its live-ingest convention (e.g. Core match 8336's maps are
+        // stored as 8336_0/8336_1, not 8336_1/8336_2).
+        let stats_match_id = format!("{}_{}", core_match.match_id, map_index);
+        let url = s3_key_to_url(key)
+            .with_context(|| format!("map {map_index} ({map_name}, s3_keys entry {key})"))?;
+        let extension = if url.path().to_ascii_lowercase().ends_with(".zip") {
+            "zip"
+        } else {
+            "7z"
+        };
+        let map_workspace = match_workspace.join(format!("map-{map_index}"));
+        fs::create_dir(&map_workspace)?;
+        let archive_path = map_workspace.join(format!("archive.{extension}"));
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "downloading",
+            Some(stats_match_id.clone()),
+            Some(key.clone()),
+            None,
+        ))?;
+        let archive_checksum = download_archive(
+            client,
+            &url,
+            &archive_path,
+            args.max_archive_gib.saturating_mul(1024 * 1024 * 1024),
+        )
+        .await
+        .with_context(|| format!("downloading map {map_index} ({map_name}, {key})"))?;
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "archive_cached",
+            Some(stats_match_id.clone()),
+            Some(archive_path.to_string_lossy().to_string()),
+            Some(json!({
+                "archiveChecksum": archive_checksum,
+                "objectKey": key,
+                "mapIndex": map_index,
+                "coreMapName": map_name,
+            })),
+        ))?;
+        inspect_archive(
+            &archive_path,
+            args.max_archive_members,
+            args.max_extracted_gib.saturating_mul(1024 * 1024 * 1024),
+        )?;
+        let extracted = map_workspace.join("extracted");
+        extract_archive(&archive_path, &extracted)?;
+        let demo = discover_single_map_demo(
+            &extracted,
+            core_match,
+            map_index,
+            map_name,
+            season_match_ids,
+        )?;
+        debug_assert_eq!(demo.stats_match_id, stats_match_id);
+        archive_evidence.push(json!({
+            "mapIndex": map_index,
+            "coreMapName": map_name,
+            "objectKey": key,
+            "archiveChecksum": archive_checksum,
+        }));
+        demos.push(demo);
+    }
+
+    if demos.is_empty() {
+        ledger.append(event(
+            args,
+            core_match.match_id,
+            "skipped_not_repairable",
+            None,
+            Some("no demos discovered across s3_keys archives".to_owned()),
+            None,
+        ))?;
+        attempt_workspace.finish(args.keep_successful || args.keep_all)?;
+        return Ok(());
+    }
+
+    for demo in &demos {
+        if args.writes() {
+            let response =
+                full_import_request(client, args, token, core_match, demo, false).await?;
+            ledger.append(event(
+                args,
+                core_match.match_id,
+                "full_reparse_applied",
+                Some(demo.stats_match_id.clone()),
+                None,
+                Some(json!({
+                    "demo": demo.relative_path,
+                    "demoChecksum": demo.checksum,
+                    "identitySource": demo.identity_source,
+                    "displacedMatchId": demo.displaced_match_id,
+                    "result": response,
+                })),
+            ))?;
+        } else {
+            ledger.append(event(
+                args,
+                core_match.match_id,
+                "full_reparse_planned",
+                Some(demo.stats_match_id.clone()),
+                None,
+                Some(json!({
+                    "demo": demo.relative_path,
+                    "demoChecksum": demo.checksum,
+                    "identitySource": demo.identity_source,
+                    "displacedMatchId": demo.displaced_match_id,
+                })),
+            ))?;
+        }
+    }
+
+    ledger.append(event(
+        args,
+        core_match.match_id,
+        "match_complete",
+        None,
+        Some(format!(
+            "{} map(s) {}",
+            demos.len(),
+            if args.writes() {
+                "reparsed"
+            } else {
+                "validated for full reparse"
+            }
+        )),
+        Some(json!({
+            "archives": archive_evidence,
+            "targets": demos.iter().map(|d| d.stats_match_id.clone()).collect::<Vec<_>>(),
+        })),
+    ))?;
+    attempt_workspace.finish(args.keep_successful || args.keep_all)?;
+    Ok(())
+}
+
 async fn process_match(
     args: &BackfillArgs,
     client: &Client,
@@ -1213,6 +1781,112 @@ async fn process_match(
             None,
         ))?;
         return Ok(());
+    }
+    // --full-reparse only, and BO3 only: prefer the canonical per-map
+    // s3_keys array over the legacy single-map demo_url when it is present
+    // *and* validates cleanly against Core's scored maps. This is gated to
+    // full-reparse because round-repair's reviewed-ledger/idempotency-key
+    // machinery (ReviewedInventory.archive_checksums, repair_request's v3
+    // idempotency key) is keyed on exactly one archive per match; extending
+    // it to N archives would need a reviewed-ledger schema change and
+    // invalidate every previously-reviewed ledger. full-reparse has no such
+    // attestation flow (add-match reparses are safe to rerun), so it can
+    // take the multi-archive path safely.
+    //
+    // It is also gated to is_bo3: CSC-Core populates a one-entry s3_keys
+    // array for BO1s too, but discover_single_map_demo always builds
+    // stats_match_id as `{match_id}_{map_index}` — the BO3 suffix
+    // convention. Taking this path for a BO1 would import under the wrong
+    // (suffixed) stats match id, creating a new record while leaving the
+    // real unsuffixed BO1 record stale. BO1s were never truncated by the
+    // original bug (a single demo_url already covers their one map), so
+    // there is nothing for this path to fix there — the legacy demo_url
+    // path below already handles BO1s correctly.
+    //
+    // s3_keys is not reliably a *complete* per-map array in practice: most
+    // season-19 BO3s have a DemoProcessingStatus row whose s3_keys holds
+    // just one key (a single per-map upload alongside the real bundled
+    // archive at demo_url) even though 2-3 maps were played, and a handful
+    // of season-20 matches have a corrupt count or order (matches 9077 and
+    // 9275 — see validate_s3_key_order). Any of those must not turn into a
+    // worse outcome than before this code existed, so a validation failure
+    // (including a malformed s3_keys value itself) logs a clear
+    // (non-terminal) ledger event and falls through to the legacy demo_url
+    // path below, same as a match with no s3_keys at all.
+    if args.full_reparse && core_match.is_bo3 {
+        let s3_keys = match parse_s3_keys(core_match.s3_keys.as_ref()) {
+            Ok(keys) => keys,
+            Err(error) => {
+                ledger.append(event(
+                    args,
+                    core_match.match_id,
+                    "s3_keys_mismatch",
+                    None,
+                    Some(format!(
+                        "s3_keys is malformed: {error:#}; falling back to the legacy demo_url path for this match"
+                    )),
+                    None,
+                ))?;
+                Vec::new()
+            }
+        };
+        if !s3_keys.is_empty() {
+            match validate_s3_key_order(&s3_keys, core_match) {
+                Ok(()) => {
+                    // A validated-but-then-unreachable s3_keys archive
+                    // (e.g. a 404 from the archival-migration issue seen on
+                    // match 9275, or any other download/extract/discover
+                    // failure) also falls back rather than failing the
+                    // whole match: some season-19 matches with a complete,
+                    // ordered s3_keys array (e.g. match 8334) have per-map
+                    // zips that 404 while their bundled demo_url archive
+                    // still serves fine, so treating this the same as a
+                    // validation mismatch avoids regressing a match that
+                    // reparses correctly today.
+                    match process_full_reparse_s3_keys(
+                        args,
+                        client,
+                        token,
+                        ledger,
+                        core_match,
+                        season_match_ids,
+                        &s3_keys,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            ledger.append(event(
+                                args,
+                                core_match.match_id,
+                                "s3_keys_mismatch",
+                                None,
+                                Some(format!(
+                                    "s3_keys archive(s) unusable ({error:#}); falling back to the legacy demo_url path for this match"
+                                )),
+                                None,
+                            ))?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    ledger.append(event(
+                        args,
+                        core_match.match_id,
+                        "s3_keys_mismatch",
+                        None,
+                        Some(format!(
+                            "{error:#}; falling back to the legacy demo_url path for this match"
+                        )),
+                        Some(json!({
+                            "s3KeysCount": s3_keys.len(),
+                            "coreScoredMapNames": core_match.scored_map_names,
+                            "s3Keys": s3_keys,
+                        })),
+                    ))?;
+                }
+            }
+        }
     }
     let Some(raw_url) = &core_match.demo_url else {
         verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "artifact_missing")?;
@@ -1245,10 +1919,18 @@ async fn process_match(
             return Ok(());
         }
     };
+    // matches_combinematches.id and matches_matches.id are independent
+    // sequences and can collide numerically; the "combines-" prefix keeps
+    // per-match workspace/archive-cache directories from colliding when a
+    // combine and a league match in the same season share a raw id.
     let match_root = args
         .workspace
         .join(format!("s{}", args.season))
-        .join(core_match.match_id.to_string());
+        .join(if args.combines {
+            format!("combines-{}", core_match.match_id)
+        } else {
+            core_match.match_id.to_string()
+        });
     fs::create_dir_all(&match_root)?;
     let attempt_name = format!(
         "attempt-{}-{}",
@@ -1371,7 +2053,7 @@ async fn process_match(
         ))?;
     }
 
-    if args.full_reparse {
+    if args.full_reparse || args.combines {
         if demos.is_empty() {
             ledger.append(event(
                 args,
@@ -1758,12 +2440,14 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     if args.writes() && args.confirm_season != Some(args.season) {
         bail!(
-            "--apply, --direct-apply, and --full-reparse require --confirm-season {}",
+            "--apply, --direct-apply, --full-reparse, and --combines require --confirm-season {}",
             args.season
         );
     }
     if !args.writes() && args.confirm_season.is_some() {
-        bail!("--confirm-season is only valid with --apply, --direct-apply, or --full-reparse");
+        bail!(
+            "--confirm-season is only valid with --apply, --direct-apply, --full-reparse, or --combines"
+        );
     }
     let reviewed_inventory = ReviewedInventory::load(&args)?;
     let cached_source_inventory = CachedSourceInventory::load(&args)?;
@@ -1805,7 +2489,11 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         .build()?;
     let mode = args.mode();
     let selected: HashSet<i64> = args.match_id.iter().copied().collect();
-    let matches = season_matches(&pool, args.season).await?;
+    let matches = if args.combines {
+        combine_season_matches(&pool, args.season).await?
+    } else {
+        season_matches(&pool, args.season).await?
+    };
     let available: HashSet<i64> = matches.iter().map(|item| item.match_id).collect();
     let mut missing_selected = selected.difference(&available).copied().collect::<Vec<_>>();
     missing_selected.sort_unstable();
@@ -1817,11 +2505,17 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         );
     }
     if let Some(inventory) = &reviewed_inventory {
-        let required_review = if selected.is_empty() {
-            &available
-        } else {
-            &selected
-        };
+        // Must match the same is_selected() filter the processing loop below
+        // uses, not the full unfiltered `available` set — otherwise a
+        // filtered dry run (e.g. --bo3-only with no --match-id) never
+        // produces terminal ledger entries for the matches it skipped, and
+        // this check would then demand review coverage the dry run never
+        // could have produced, failing every apply run before it starts.
+        let required_review: HashSet<i64> = matches
+            .iter()
+            .filter(|item| is_selected(item, args.bo3_only, &selected))
+            .map(|item| item.match_id)
+            .collect();
         let missing_review = required_review
             .difference(&inventory.terminal_matches)
             .copied()
@@ -1834,14 +2528,22 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         }
     }
     println!(
-        "Season {}: {} Core matches found; mode={mode}; concurrency=1",
+        "Season {}: {} Core matches found{}; mode={mode}; concurrency=1",
         args.season,
-        matches.len()
+        matches.len(),
+        if args.bo3_only {
+            format!(
+                " ({} BO3)",
+                matches.iter().filter(|item| item.is_bo3).count()
+            )
+        } else {
+            String::new()
+        }
     );
     let mut processed = 0_usize;
     let mut failures = 0_usize;
     for core_match in matches {
-        if !selected.is_empty() && !selected.contains(&core_match.match_id) {
+        if !is_selected(&core_match, args.bo3_only, &selected) {
             continue;
         }
         if ledger.is_complete(args.season, mode, core_match.match_id) {
@@ -1939,6 +2641,8 @@ mod tests {
             marked_forfeit: false,
             legacy_one_zero: false,
             has_forfeit_audit: false,
+            scored_map_names: Vec::new(),
+            s3_keys: None,
         }
     }
 
@@ -1948,6 +2652,7 @@ mod tests {
             apply: false,
             direct_apply: false,
             full_reparse: false,
+            combines: false,
             confirm_season: None,
             parser_version: Some("test-parser".to_owned()),
             workspace: workspace.to_path_buf(),
@@ -1960,6 +2665,7 @@ mod tests {
             pause_seconds: 0,
             limit: None,
             match_id: Vec::new(),
+            bo3_only: false,
             keep_successful: false,
             keep_all: false,
             max_archive_gib: 8,
@@ -2083,6 +2789,259 @@ mod tests {
     }
 
     #[test]
+    fn combines_does_not_require_parser_version_and_defaults_to_dry_run() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.parser_version.is_none());
+        assert!(!args.writes());
+        assert_eq!(args.mode(), "combines-full-reparse-dry-run");
+    }
+
+    #[test]
+    fn combines_writes_only_once_confirm_season_is_supplied() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--confirm-season",
+                "12",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.writes());
+        assert_eq!(args.mode(), "combines-full-reparse");
+    }
+
+    #[test]
+    fn combines_conflicts_with_full_reparse_and_round_repair_modes() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--full-reparse",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--apply",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--direct-apply",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn combines_conflicts_with_bo3_only() {
+        // combine_season_matches() always synthesizes is_bo3 = false, so
+        // --bo3-only --combines would silently filter out every combine and
+        // produce an empty, confusing run. Reject the combination at the
+        // CLI level instead.
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        assert!(command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--combines",
+                "--bo3-only",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+        assert!(command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--bo3-only",
+                "--combines",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn combines_ledger_mode_is_distinct_from_league_full_reparse_mode() {
+        // The ledger dedups on (season, mode, match_id), and
+        // matches_combinematches.id / matches_matches.id are independent
+        // sequences that can numerically collide within the same season.
+        // Distinct mode strings keep a combine run from being mistaken for
+        // (or masking) a league-match run that happens to share an id.
+        let root = test_path("combines-mode");
+        let mut combines_args = backfill_args(&root);
+        combines_args.combines = true;
+        combines_args.full_reparse = false;
+        let mut league_args = backfill_args(&root);
+        league_args.full_reparse = true;
+        assert_ne!(combines_args.mode(), league_args.mode());
+        assert_eq!(combines_args.mode(), "combines-full-reparse-dry-run");
+        assert_eq!(league_args.mode(), "full-reparse-dry-run");
+    }
+
+    #[test]
+    fn full_import_identity_prefixes_combine_match_ids_and_uses_combine_match_type() {
+        let root = test_path("full-import-identity");
+        let mut combines_args = backfill_args(&root);
+        combines_args.combines = true;
+        let combine_core_match = core_match(8440, false);
+        let (match_id, match_type) =
+            full_import_identity(&combines_args, &combine_core_match, "8440");
+        assert_eq!(match_id, "combines-8440");
+        assert_eq!(match_type, "Combine");
+
+        // Even if a combine's CoreMatch were mistakenly marked is_bo3 (it
+        // never is in practice: combines are always single-map), --combines
+        // should still win and report "Combine", not "Playoff".
+        let miscoded = core_match(8440, true);
+        let (_, match_type) = full_import_identity(&combines_args, &miscoded, "8440");
+        assert_eq!(match_type, "Combine");
+
+        let league_args = backfill_args(&root);
+        let bo1 = core_match(500, false);
+        let (match_id, match_type) = full_import_identity(&league_args, &bo1, "500");
+        assert_eq!(match_id, "500");
+        assert_eq!(match_type, "Regulation");
+
+        let bo3 = core_match(501, true);
+        let (match_id, match_type) = full_import_identity(&league_args, &bo3, "501_1");
+        assert_eq!(match_id, "501_1");
+        assert_eq!(match_type, "Playoff");
+    }
+
+    #[test]
+    fn is_selected_bo3_only_skips_bo1s() {
+        let bo1 = core_match(1, false);
+        let bo3 = core_match(2, true);
+        let empty = HashSet::new();
+        assert!(!is_selected(&bo1, true, &empty));
+        assert!(is_selected(&bo3, true, &empty));
+        // Without --bo3-only, both are selected.
+        assert!(is_selected(&bo1, false, &empty));
+        assert!(is_selected(&bo3, false, &empty));
+    }
+
+    #[test]
+    fn is_selected_combines_bo3_only_with_match_id() {
+        let bo3_a = core_match(10, true);
+        let bo3_b = core_match(11, true);
+        let bo1 = core_match(12, false);
+        let selected = HashSet::from([10, 12]);
+        // --bo3-only AND --match-id are both active: a match must satisfy
+        // both, so the BO1 in the --match-id set is still excluded.
+        assert!(is_selected(&bo3_a, true, &selected));
+        assert!(!is_selected(&bo3_b, true, &selected));
+        assert!(!is_selected(&bo1, true, &selected));
+    }
+
+    #[test]
+    fn is_selected_match_id_alone_is_unaffected_by_bo3_only_default() {
+        let bo1 = core_match(5, false);
+        let selected = HashSet::from([5]);
+        assert!(is_selected(&bo1, false, &selected));
+        assert!(!is_selected(&bo1, false, &HashSet::from([6])));
+    }
+
+    #[test]
+    fn bo3_only_is_a_match_selection_filter_not_a_mode() {
+        // --bo3-only must compose with every mode (dry-run, --full-reparse,
+        // --apply, --direct-apply) rather than conflicting with any of
+        // them, the same way --match-id does.
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .clone()
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--bo3-only",
+                "--full-reparse",
+                "--confirm-season",
+                "12",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.bo3_only);
+        assert!(args.writes());
+
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--bo3-only",
+                "--direct-apply",
+                "--confirm-season",
+                "12",
+                "--parser-version",
+                "test-parser",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.bo3_only);
+        assert!(args.writes());
+    }
+
+    #[test]
+    fn bo3_only_defaults_to_false_and_processes_every_match() {
+        let command = BackfillArgs::augment_args(Command::new("backfill"));
+        let matches = command
+            .try_get_matches_from([
+                "backfill",
+                "--season",
+                "12",
+                "--full-reparse",
+                "--api-path-root",
+                "/round-repair-work",
+            ])
+            .unwrap();
+        let args = BackfillArgs::from_arg_matches(&matches).unwrap();
+        assert!(!args.bo3_only);
+    }
+
+    #[test]
     fn cached_source_inventory_requires_the_ledger_digest_and_consistent_checksums() {
         let root = test_path("cached-source-inventory");
         fs::create_dir_all(&root).unwrap();
@@ -2176,6 +3135,218 @@ mod tests {
             "https://user@f005.backblazeb2.com/file/csc-demo-archive/match.7z"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_s3_keys_treats_null_and_empty_as_absent() {
+        assert_eq!(parse_s3_keys(None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_s3_keys(Some(&Value::Null)).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_s3_keys(Some(&json!([]))).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_s3_keys_preserves_array_order() {
+        let value = json!(["s20/M10/map-a.dem.zip", "s20/M10/map-b.dem.zip"]);
+        assert_eq!(
+            parse_s3_keys(Some(&value)).unwrap(),
+            vec![
+                "s20/M10/map-a.dem.zip".to_owned(),
+                "s20/M10/map-b.dem.zip".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_s3_keys_rejects_non_array_and_non_string_elements() {
+        assert!(parse_s3_keys(Some(&json!("not-an-array"))).is_err());
+        assert!(parse_s3_keys(Some(&json!([1, 2]))).is_err());
+        assert!(parse_s3_keys(Some(&json!(["ok", null]))).is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_builds_the_do_cdn_url_for_a_bare_key() {
+        let url =
+            s3_key_to_url("s20/M10/s20-M10-Demons-vs-Foo-mid9077-0_de_anubis.dem.zip").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s20/M10/s20-M10-Demons-vs-Foo-mid9077-0_de_anubis.dem.zip"
+        );
+    }
+
+    #[test]
+    fn s3_key_to_url_accepts_an_allowlisted_absolute_url_from_an_admin_correction() {
+        // CSC-Core's Match admin lets ops paste a corrected demo URL directly
+        // into s3_keys (e.g. a migrated Backblaze URL); it's stored verbatim,
+        // not re-relativized to a DO CDN key. This must not be rejected —
+        // that would fail the s3_keys path and fall back to the legacy
+        // demo_url, recreating the truncation this path exists to fix.
+        let url = s3_key_to_url(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s20/M10/corrected.dem.zip",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s20/M10/corrected.dem.zip"
+        );
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_absolute_urls_off_the_csc_archive_allowlist() {
+        assert!(s3_key_to_url("https://attacker.example/key.dem.zip").is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_a_bare_leading_slash_value() {
+        assert!(s3_key_to_url("/absolute/key.dem.zip").is_err());
+    }
+
+    #[test]
+    fn s3_key_to_url_rejects_a_non_archive_extension() {
+        assert!(s3_key_to_url("s20/M10/not-an-archive.txt").is_err());
+    }
+
+    #[test]
+    fn validate_s3_key_order_accepts_matching_length_and_map_names() {
+        let mut core = core_match(9223, true);
+        core.scored_map_names = vec!["de_nuke".to_owned(), "de_anubis".to_owned()];
+        let keys = vec![
+            "s20/M13/....-mid9223-0_de_nuke-....dem.zip".to_owned(),
+            "s20/M13/....-mid9223-1_de_anubis-....dem.zip".to_owned(),
+        ];
+        assert!(validate_s3_key_order(&keys, &core).is_ok());
+    }
+
+    #[test]
+    fn validate_s3_key_order_rejects_extra_keys_like_the_9077_duplicate_upload() {
+        // Match 9077's real shape: 4 s3_keys entries (a mid-match-restart
+        // duplicate de_inferno upload) but only 3 scored maps.
+        let mut core = core_match(9077, true);
+        core.scored_map_names = vec![
+            "de_anubis".to_owned(),
+            "de_inferno".to_owned(),
+            "de_ancient".to_owned(),
+        ];
+        let keys = vec![
+            "..._de_anubis_...".to_owned(),
+            "..._de_inferno_a_...".to_owned(),
+            "..._de_inferno_b_...".to_owned(),
+            "..._de_ancient_...".to_owned(),
+        ];
+        assert!(validate_s3_key_order(&keys, &core).is_err());
+    }
+
+    #[test]
+    fn validate_s3_key_order_rejects_fewer_keys_than_scored_maps() {
+        let mut core = core_match(9275, true);
+        core.scored_map_names = vec![
+            "de_anubis".to_owned(),
+            "de_nuke".to_owned(),
+            "de_nuke".to_owned(),
+        ];
+        let keys = vec!["..._de_anubis_...".to_owned(), "..._de_nuke_...".to_owned()];
+        assert!(validate_s3_key_order(&keys, &core).is_err());
+    }
+
+    #[test]
+    fn validate_s3_key_order_rejects_a_same_length_reshuffle() {
+        // Match 9275's own real shape: keys are [anubis, anubis, nuke] but
+        // the scored maps are [anubis, nuke, nuke] — same count (3 and 3),
+        // different order. Position 1 disagrees (anubis vs nuke) and must
+        // fail closed rather than writing the wrong map into 9275_1.
+        let mut core = core_match(9275, true);
+        core.scored_map_names = vec![
+            "de_anubis".to_owned(),
+            "de_nuke".to_owned(),
+            "de_nuke".to_owned(),
+        ];
+        let keys = vec![
+            "..._de_anubis_2026-07-24_...".to_owned(),
+            "..._de_anubis_2026-07-25_...".to_owned(),
+            "..._de_nuke_2026-07-25_...".to_owned(),
+        ];
+        assert!(validate_s3_key_order(&keys, &core).is_err());
+    }
+
+    #[test]
+    fn validate_s3_key_order_is_case_insensitive() {
+        let mut core = core_match(1, true);
+        core.scored_map_names = vec!["de_Anubis".to_owned()];
+        let keys = vec!["...DE_ANUBIS...".to_owned()];
+        assert!(validate_s3_key_order(&keys, &core).is_ok());
+    }
+
+    #[test]
+    fn discover_single_map_demo_ignores_the_unreliable_filename_digit() {
+        // Two archives whose filenames both embed the same "-0_" digit
+        // (the Core-planning#242 item 2 bug) must still be told apart by
+        // the caller-supplied map_index (array position), not the digit.
+        let root = test_path("s3-keys-single-map");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("s20-M10-Demons-vs-Foo-mid9077-0_de_anubis.dem"),
+            b"demo",
+        )
+        .unwrap();
+        let demo = discover_single_map_demo(
+            &root,
+            &core_match(9077, true),
+            1,
+            "de_anubis",
+            &HashSet::from([9077]),
+        )
+        .unwrap();
+        // stats_match_id uses the zero-based map_index (CSC-Stats'
+        // convention), not any value derived from the map name.
+        assert_eq!(demo.stats_match_id, "9077_1");
+        assert_eq!(demo.identity_source, "s3_keys_array_order");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_single_map_demo_rejects_zero_or_multiple_dems() {
+        let root = test_path("s3-keys-empty");
+        fs::create_dir_all(&root).unwrap();
+        assert!(discover_single_map_demo(
+            &root,
+            &core_match(9077, true),
+            0,
+            "de_anubis",
+            &HashSet::from([9077])
+        )
+        .is_err());
+        fs::write(root.join("a.dem"), b"1").unwrap();
+        fs::write(root.join("b.dem"), b"2").unwrap();
+        assert!(discover_single_map_demo(
+            &root,
+            &core_match(9077, true),
+            0,
+            "de_anubis",
+            &HashSet::from([9077])
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_single_map_demo_still_fails_closed_on_a_displaced_match_id() {
+        let root = test_path("s3-keys-displaced");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("s20-mid555-0_de_anubis.dem"), b"demo").unwrap();
+        assert!(discover_single_map_demo(
+            &root,
+            &core_match(9077, true),
+            0,
+            "de_anubis",
+            &HashSet::from([9077, 555]),
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
