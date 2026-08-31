@@ -193,6 +193,9 @@ struct CoreMatch {
     // Absent (NULL/empty) for BO1s and for matches that predate per-map
     // uploads (those got a single bundled archive at demo_url instead).
     s3_keys: Option<Value>,
+    // Present only for rows sourced from matches_combinematches. The stored
+    // value, not an archive filename, decides the Stats match type.
+    queue_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -760,7 +763,8 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(sf.legacy_one_zero, false) AS legacy_one_zero,
                coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit,
                coalesce(sf.scored_map_names, ARRAY[]::text[]) AS scored_map_names,
-               dps.s3_keys AS s3_keys
+               dps.s3_keys AS s3_keys,
+               NULL::text AS queue_mode
         FROM matches_matches m
         JOIN leagues_matchday md ON md.id = m.match_day_id
         JOIN leagues_seasons s ON s.id = md.season_id
@@ -787,6 +791,7 @@ struct CombineMatchRow {
     demo_url: Option<String>,
     tier: Option<String>,
     match_date: String,
+    queue_mode: String,
 }
 
 /// Fetches a season's combine matches (matches_combinematches), shaped as
@@ -797,13 +802,9 @@ struct CombineMatchRow {
 /// only gate the round-repair path, never taken for combines) are always
 /// false.
 ///
-/// matches_combinematches has no season foreign key the way matches_matches
-/// has via leagues_matchday -> leagues_seasons, so season scoping can't be a
-/// SQL join. CSC's demo archival tooling embeds the season as an `sNN/` path
-/// segment in demo_url (verified against prod-mirrored data: every archived
-/// combine and league match demo_url carries this segment), so that's what
-/// this query filters on. The regex requires a trailing `/` after the season
-/// number so season 1 cannot match season 10-19's `s1N/` prefix.
+/// New rows are scoped through CombineMatches.season. The archive-path check is
+/// retained only as an explicit fallback for historical rows whose season_id
+/// is null; it is not used when persisted season data exists.
 ///
 /// tier_id is nullable on matches_combinematches (unlike a league match's
 /// tier, which is always derivable from its teams), so this is an inner join:
@@ -818,14 +819,19 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
         SELECT mm.id AS match_id,
                mm.demo_url,
                pt.name AS tier,
+               mm.queue_mode,
                to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date
         FROM matches_combinematches mm
         JOIN players_tiers pt ON pt.id = mm.tier_id
+        LEFT JOIN leagues_seasons s ON s.id = mm.season_id
         WHERE mm.cancelled = false
           AND mm.game_finished = true
           AND mm.demo_url IS NOT NULL
-          AND mm.demo_url ~ ('/s' || $1::text || '/')
+          AND (
+            s.number = $1 OR
+            (mm.season_id IS NULL AND mm.demo_url ~ ('/s' || $1::text || '/'))
+          )
         ORDER BY mm.scheduled_date, mm.id
         "#,
     )
@@ -853,6 +859,7 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
             // being single-map.
             scored_map_names: Vec::new(),
             s3_keys: None,
+            queue_mode: Some(row.queue_mode),
         })
         .collect())
 }
@@ -1474,18 +1481,21 @@ async fn repair_request(
 }
 
 /// Computes the add-match `matchId`/`matchType` for a discovered demo. For
-/// combines this applies the `combines-{id}` prefix that CSC-Stats'
+/// combine-shaped matches this applies the `combines-{id}` prefix that CSC-Stats'
 /// `handle-add-match.ts` expects to distinguish combine imports from league
 /// match imports (the same convention main.rs's single-file import path
-/// already applies), and a "Combine" matchType distinct from
-/// Regulation/Playoff.
+/// already applies). The persisted queue_mode selects Combine versus FAColo.
 fn full_import_identity(
     args: &BackfillArgs,
     core_match: &CoreMatch,
     stats_match_id: &str,
 ) -> (String, &'static str) {
     if args.combines {
-        (format!("combines-{stats_match_id}"), "Combine")
+        let match_type = match core_match.queue_mode.as_deref() {
+            Some("fa_colo") => "FAColo",
+            _ => "Combine",
+        };
+        (format!("combines-{stats_match_id}"), match_type)
     } else {
         (
             stats_match_id.to_owned(),
@@ -2643,6 +2653,7 @@ mod tests {
             has_forfeit_audit: false,
             scored_map_names: Vec::new(),
             s3_keys: None,
+            queue_mode: None,
         }
     }
 
@@ -2927,6 +2938,12 @@ mod tests {
             full_import_identity(&combines_args, &combine_core_match, "8440");
         assert_eq!(match_id, "combines-8440");
         assert_eq!(match_type, "Combine");
+
+        let mut fa_colo = core_match(8441, false);
+        fa_colo.queue_mode = Some("fa_colo".to_owned());
+        let (match_id, match_type) = full_import_identity(&combines_args, &fa_colo, "8441");
+        assert_eq!(match_id, "combines-8441");
+        assert_eq!(match_type, "FAColo");
 
         // Even if a combine's CoreMatch were mistakenly marked is_bo3 (it
         // never is in practice: combines are always single-map), --combines
