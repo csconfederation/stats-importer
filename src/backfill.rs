@@ -58,16 +58,16 @@ pub struct BackfillArgs {
     )]
     full_reparse: bool,
 
-    /// Reparse a season's combine matches (matches_combinematches) instead of
-    /// league matches (matches_matches). Combines have no round-repair concept
+    /// Reparse a season's Combine and FA Colo matches (matches_combinematches)
+    /// instead of league matches (matches_matches). These matches have no round-repair concept
     /// (no per-round stat correction target) and are always a single map, so
     /// this always behaves like --full-reparse: it downloads/discovers demos
     /// and, once --confirm-season is supplied, reparses them through the same
     /// add-match ingest path used for league matches, with the resulting
     /// stats match id prefixed `combines-{id}` so CSC-Stats' add-match handler
-    /// treats it as a combine import. Combine matches have no season foreign
-    /// key in Core's schema, so season scoping is inferred from the `sNN/`
-    /// path segment CSC's demo archival tooling puts in demo_url.
+    /// treats it as a combine import. matchType follows the persisted queue_mode.
+    /// Season scoping prefers the persisted season_id; the `sNN/` demo_url path
+    /// is used only for legacy rows whose season_id is null.
     #[arg(
         long,
         conflicts_with_all = ["apply", "direct_apply", "full_reparse", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256", "bo3_only"]

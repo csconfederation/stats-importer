@@ -296,6 +296,11 @@ is what CSC-Stats' add-match handler and `stats-importer`'s own single-file
 import mode already use to keep combine imports out of the league-match id
 space.
 
+For legacy single-file imports, `--combine` and `--league` explicitly select
+the Core table when the same numeric id exists in both. Without an override,
+an exact persisted `demo_url` basename wins; otherwise combine/FA Colo filename
+markers break ties, with league remaining the safe default.
+
 Season scoping uses `matches_combinematches.season_id`. The `sNN/` segment in
 `demo_url` is consulted only for legacy rows whose season foreign key is null. A
 combine with no tier assigned (`tier_id` is nullable, unlike a league match's

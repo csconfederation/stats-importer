@@ -41,6 +41,14 @@ struct Args {
     /// fix demo team names (optional)
     #[arg(long)]
     fix_team_names: Option<bool>,
+
+    /// Treat legacy single-file imports as combine/FA Colo matches.
+    #[arg(long, conflicts_with = "league")]
+    combine: bool,
+
+    /// Treat legacy single-file imports as league matches.
+    #[arg(long, conflicts_with = "combine")]
+    league: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -128,6 +136,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         }
         None => {
             println!("Cannot parse match id from filename, using args...");
+            let is_combine = legacy_file_is_combine(&args, filename);
             let Some(season) = args.season else {
                 return Err(anyhow!("--season arg not provided, skipping..."));
             };
@@ -144,8 +153,12 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 match_day,
                 is_series: false,
                 match_date: None,
-                is_combine: false,
-                match_type: "Regulation".to_owned(),
+                is_combine,
+                match_type: if is_combine {
+                    "Combine".to_owned()
+                } else {
+                    "Regulation".to_owned()
+                },
                 demo_url: None,
             }
         }
@@ -257,7 +270,6 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
                 join teams_teams ht on mm.home_id = ht.id
                 join teams_teams at on mm.away_id = at.id
                 join players_tiers pt on ht.tier_id = pt.id
-                join matches_matchlobby ml on ml.id = mm.lobby_id
         where mm.id = $1;
     "#,
     )
@@ -287,14 +299,22 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
     .fetch_optional(pool)
     .await?;
 
-    let combine_match = combine_match
-        .map(|combine| {
+    match select_match_source(
+        id,
+        league_match.as_ref(),
+        combine_match.as_ref(),
+        filename,
+        args,
+    )? {
+        MatchSource::League => Ok(league_match.expect("selected league match must exist")),
+        MatchSource::Combine => {
+            let combine = combine_match.expect("selected combine match must exist");
             let season = combine.season.or(args.season.map(i32::from)).ok_or_else(|| {
                 anyhow!(
                     "Core combine match {id} has no persisted season; provide --season for this legacy row"
                 )
             })?;
-            Ok::<MatchInfo, anyhow::Error>(MatchInfo {
+            Ok(MatchInfo {
                 match_id: combine.match_id,
                 season,
                 tier: combine.tier,
@@ -305,60 +325,276 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
                 match_type: combine.match_type,
                 demo_url: combine.demo_url,
             })
-        })
-        .transpose()?;
+        }
+    }
+}
 
-    match (league_match, combine_match) {
-        (Some(league), None) => Ok(league),
-        (None, Some(combine)) => Ok(combine),
+#[derive(Debug, PartialEq, Eq)]
+enum MatchSource {
+    League,
+    Combine,
+}
+
+fn select_match_source(
+    id: i64,
+    league: Option<&MatchInfo>,
+    combine: Option<&CombineMatchInfo>,
+    filename: &str,
+    args: &Args,
+) -> Result<MatchSource> {
+    if args.league {
+        return league
+            .map(|_| MatchSource::League)
+            .ok_or_else(|| anyhow!("Core league match id {id} was not found"));
+    }
+    if args.combine {
+        return combine
+            .map(|_| MatchSource::Combine)
+            .ok_or_else(|| anyhow!("Core combine match id {id} was not found"));
+    }
+
+    match (league, combine) {
+        (Some(_), None) => Ok(MatchSource::League),
         (None, None) => Err(anyhow!("Core match id {id} was not found")),
+        (None, Some(combine)) => {
+            if demo_url_matches_filename(combine.demo_url.as_deref(), filename)
+                || filename_indicates_combine(filename)
+            {
+                Ok(MatchSource::Combine)
+            } else {
+                Err(anyhow!(
+                    "Core match id {id} was not found as a league match; use --combine to select the colliding combine/FA Colo row"
+                ))
+            }
+        }
         (Some(league), Some(combine)) => {
-            // The two Core tables have independent id sequences. When an id
-            // exists in both, use Core's persisted demo URL to resolve the
-            // local file; the filename itself is never a match-type signal.
             let league_matches = demo_url_matches_filename(league.demo_url.as_deref(), filename);
             let combine_matches = demo_url_matches_filename(combine.demo_url.as_deref(), filename);
             match (league_matches, combine_matches) {
-                (true, false) => Ok(league),
-                (false, true) => Ok(combine),
-                _ => Err(anyhow!(
-                    "Core match id {id} exists in both league and combine tables and demo_url does not identify {filename} uniquely"
-                )),
+                (true, false) => Ok(MatchSource::League),
+                (false, true) => Ok(MatchSource::Combine),
+                _ if filename_indicates_combine(filename) => Ok(MatchSource::Combine),
+                _ => Ok(MatchSource::League),
             }
         }
     }
 }
 
 fn demo_url_matches_filename(demo_url: Option<&str>, filename: &str) -> bool {
-    let filename = filename
-        .trim_end_matches(".zip")
-        .trim_end_matches(".dem")
-        .to_ascii_lowercase();
+    let filename = normalized_demo_basename(filename);
     demo_url
         .and_then(|url| url.rsplit('/').next())
-        .map(|name| {
-            name.trim_end_matches(".7z")
-                .trim_end_matches(".zip")
-                .trim_end_matches(".dem")
-                .to_ascii_lowercase()
-                .contains(&filename)
-        })
+        .map(normalized_demo_basename)
+        .map(|name| name == filename)
         .unwrap_or(false)
+}
+
+fn normalized_demo_basename(value: &str) -> String {
+    let mut normalized = value
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    loop {
+        let Some(stripped) = [".7z", ".zip", ".dem"]
+            .iter()
+            .find_map(|suffix| normalized.strip_suffix(suffix))
+        else {
+            return normalized;
+        };
+        normalized = stripped.to_owned();
+    }
+}
+
+fn filename_indicates_combine(filename: &str) -> bool {
+    let filename = filename.to_ascii_lowercase();
+    filename.contains("combine") || filename.contains("fa-colo") || filename.contains("fa_colo")
+}
+
+fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
+    args.combine || (!args.league && filename_indicates_combine(filename))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::demo_url_matches_filename;
+    use super::{
+        demo_url_matches_filename, legacy_file_is_combine, select_match_source, Args,
+        CombineMatchInfo, MatchInfo, MatchSource,
+    };
+
+    fn args() -> Args {
+        Args {
+            command: None,
+            directory: None,
+            tier: None,
+            season: None,
+            match_day: None,
+            fix_core_scores: None,
+            fix_team_names: None,
+            combine: false,
+            league: false,
+        }
+    }
+
+    fn league(demo_url: Option<&str>) -> MatchInfo {
+        MatchInfo {
+            match_id: Some("8088".to_owned()),
+            season: 20,
+            tier: "Premier".to_owned(),
+            match_day: "M10".to_owned(),
+            is_series: false,
+            match_date: None,
+            is_combine: false,
+            match_type: "Regulation".to_owned(),
+            demo_url: demo_url.map(str::to_owned),
+        }
+    }
+
+    fn combine(demo_url: Option<&str>) -> CombineMatchInfo {
+        CombineMatchInfo {
+            match_id: Some("8088".to_owned()),
+            season: Some(20),
+            tier: "Premier".to_owned(),
+            match_date: None,
+            match_type: "FAColo".to_owned(),
+            demo_url: demo_url.map(str::to_owned),
+        }
+    }
 
     #[test]
-    fn persisted_demo_url_resolves_a_colliding_core_id() {
+    fn archive_extensions_are_trimmed_symmetrically_and_names_compare_exactly() {
         assert!(demo_url_matches_filename(
-            Some("https://example.invalid/s20/FA-Colo-s20-mid42-map1.7z"),
-            "FA-Colo-s20-mid42-map1.dem"
+            Some("https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s20/M10/s20-M10-Demons-vs-Foo-mid8088-0_de_anubis.dem.zip"),
+            "s20-M10-Demons-vs-Foo-mid8088-0_de_anubis.dem.7z"
         ));
         assert!(!demo_url_matches_filename(
-            Some("https://example.invalid/s20/combine-s20-mid42-map1.7z"),
-            "FA-Colo-s20-mid42-map1.dem"
+            Some("https://example.invalid/s20/prefix-s20-mid8088-map1.7z"),
+            "s20-mid8088-map1.dem"
         ));
+    }
+
+    #[test]
+    fn persisted_urls_resolve_a_realistic_colliding_id() {
+        // Core id 8005 exists in both tables with these production-shaped URLs.
+        let league = league(Some(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s19/M07/s19-M07-PhoFighters-vs-Nightshades-mid8005.7z",
+        ));
+        let combine = combine(Some(
+            "https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s20/Combines/05-03/combine-contender-mid8005-0_de_nuke-2026-05-04_05-56-55.dem.zip",
+        ));
+        let args = args();
+
+        assert_eq!(
+            select_match_source(
+                8005,
+                Some(&league),
+                Some(&combine),
+                "s19-M07-PhoFighters-vs-Nightshades-mid8005.dem",
+                &args
+            )
+            .unwrap(),
+            MatchSource::League
+        );
+        assert_eq!(
+            select_match_source(
+                8005,
+                Some(&league),
+                Some(&combine),
+                "combine-contender-mid8005-0_de_nuke-2026-05-04_05-56-55.dem.7z",
+                &args
+            )
+            .unwrap(),
+            MatchSource::Combine
+        );
+    }
+
+    #[test]
+    fn collision_without_url_evidence_uses_filename_then_defaults_to_league() {
+        let league = league(None);
+        let combine = combine(None);
+        let args = args();
+
+        assert_eq!(
+            select_match_source(
+                8088,
+                Some(&league),
+                Some(&combine),
+                "manual-combine-mid8088.dem",
+                &args
+            )
+            .unwrap(),
+            MatchSource::Combine
+        );
+        assert_eq!(
+            select_match_source(
+                8088,
+                Some(&league),
+                Some(&combine),
+                "renamed-mid8088.dem",
+                &args
+            )
+            .unwrap(),
+            MatchSource::League
+        );
+    }
+
+    #[test]
+    fn combine_only_row_requires_positive_evidence_or_explicit_flag() {
+        let combine = combine(None);
+        let mut args = args();
+        assert!(select_match_source(
+            8088,
+            None,
+            Some(&combine),
+            "historical-league-mid8088.dem",
+            &args
+        )
+        .is_err());
+
+        args.combine = true;
+        assert_eq!(
+            select_match_source(8088, None, Some(&combine), "renamed-mid8088.dem", &args).unwrap(),
+            MatchSource::Combine
+        );
+    }
+
+    #[test]
+    fn no_mid_fallback_preserves_combine_typing_and_honors_overrides() {
+        let mut args = args();
+        assert!(legacy_file_is_combine(
+            &args,
+            "season20-combine-contender.dem"
+        ));
+
+        args.league = true;
+        assert!(!legacy_file_is_combine(
+            &args,
+            "season20-combine-contender.dem"
+        ));
+
+        args.league = false;
+        args.combine = true;
+        assert!(legacy_file_is_combine(&args, "renamed-recording.dem"));
+    }
+
+    #[test]
+    fn league_selection_ignores_an_irrelevant_legacy_combine_season() {
+        let league = league(Some(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s19/M07/s19-M07-PhoFighters-vs-Nightshades-mid8005.7z",
+        ));
+        let mut combine = combine(None);
+        combine.season = None;
+
+        assert_eq!(
+            select_match_source(
+                8005,
+                Some(&league),
+                Some(&combine),
+                "s19-M07-PhoFighters-vs-Nightshades-mid8005.dem",
+                &args()
+            )
+            .unwrap(),
+            MatchSource::League
+        );
     }
 }
