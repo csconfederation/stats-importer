@@ -284,20 +284,25 @@ scripts/run-backfill-nice.sh \
 
 ## Combine reparse
 
-`--combines` reparses a season's combine matches (`matches_combinematches`)
-instead of league matches. Combines have no round-repair concept (there's no
+`--combines` reparses a season's Combine and FA Colo matches
+(`matches_combinematches`) instead of league matches. These matches have no round-repair concept (there's no
 per-round `PlayerMatchStats` correction target) and are always a single map,
 so `--combines` behaves like `--full-reparse` — same download/discover/ledger
 machinery, same `/api/add-match` ingest call with `createOnly: false` once
 `--confirm-season` is supplied — just sourced from the combine table. It sends
-`matchType: "Combine"` and prefixes the Stats match id `combines-{id}`, which
+`matchType: "Combine"` or `matchType: "FAColo"` from the persisted
+`queue_mode` and prefixes the Stats match id `combines-{id}`, which
 is what CSC-Stats' add-match handler and `stats-importer`'s own single-file
 import mode already use to keep combine imports out of the league-match id
 space.
 
-`matches_combinematches` has no season foreign key (no `leagues_matchday` /
-`leagues_seasons` join is possible), so season scoping comes from the `sNN/`
-path segment CSC's demo archival tooling puts in `demo_url` instead. A
+For legacy single-file imports, `--combine` and `--league` explicitly select
+the Core table when the same numeric id exists in both. Without an override,
+an exact persisted `demo_url` basename wins; otherwise combine/FA Colo filename
+markers break ties, with league remaining the safe default.
+
+Season scoping uses `matches_combinematches.season_id`. The `sNN/` segment in
+`demo_url` is consulted only for legacy rows whose season foreign key is null. A
 combine with no tier assigned (`tier_id` is nullable, unlike a league match's
 derivable-from-teams tier) is excluded from the season inventory rather than
 downloaded and failed at apply time.
