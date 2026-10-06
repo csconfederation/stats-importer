@@ -170,6 +170,7 @@ pub struct BackfillArgs {
 struct CoreMatch {
     match_id: i64,
     is_bo3: bool,
+    is_playoff: bool,
     demo_url: Option<String>,
     map_count: i64,
     played_map_numbers: Vec<i32>,
@@ -752,6 +753,7 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
         )
         SELECT m.id AS match_id,
                m.is_bo3,
+               m.is_playoff,
                m.demo_url,
                coalesce(sf.map_count, 0)::bigint AS map_count,
                coalesce(sf.played_map_numbers, ARRAY[]::integer[]) AS played_map_numbers,
@@ -843,6 +845,7 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
         .map(|row| CoreMatch {
             match_id: row.match_id,
             is_bo3: false,
+            is_playoff: false,
             demo_url: row.demo_url,
             map_count: 1,
             played_map_numbers: vec![1],
@@ -1499,7 +1502,7 @@ fn full_import_identity(
     } else {
         (
             stats_match_id.to_owned(),
-            if core_match.is_bo3 {
+            if core_match.is_playoff {
                 "Playoff"
             } else {
                 "Regulation"
@@ -2642,6 +2645,7 @@ mod tests {
         CoreMatch {
             match_id: id,
             is_bo3,
+            is_playoff: false,
             demo_url: None,
             map_count: 1,
             played_map_numbers: vec![1],
@@ -2958,10 +2962,16 @@ mod tests {
         assert_eq!(match_id, "500");
         assert_eq!(match_type, "Regulation");
 
+        let mut playoff_bo1 = core_match(502, false);
+        playoff_bo1.is_playoff = true;
+        let (_, match_type) = full_import_identity(&league_args, &playoff_bo1, "502");
+        assert_eq!(match_type, "Playoff");
+
+        // is_bo3 alone no longer implies playoff.
         let bo3 = core_match(501, true);
         let (match_id, match_type) = full_import_identity(&league_args, &bo3, "501_1");
         assert_eq!(match_id, "501_1");
-        assert_eq!(match_type, "Playoff");
+        assert_eq!(match_type, "Regulation");
     }
 
     #[test]

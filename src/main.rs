@@ -262,7 +262,7 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
                to_char(coalesce(mm.completed_at, mm.scheduled_date) AT TIME ZONE 'UTC',
                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as match_date,
                false as is_combine,
-               case when is_bo3 then 'Playoff' else 'Regulation' end::text as match_type,
+               case when mm.is_playoff then 'Playoff' else 'Regulation' end::text as match_type,
                mm.demo_url
             from matches_matches mm
                 join leagues_matchday lm on lm.id = mm.match_day_id
