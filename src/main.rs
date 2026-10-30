@@ -126,13 +126,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Some(captures) => {
             let mid = captures.get(0).unwrap().as_str();
             let id = mid.replace("-", "").replace("mid", "").parse::<i64>()?;
-            let mut info = get_core_match(id, pool, filename, &args).await?;
-            info.match_id = if info.is_combine {
-                Some(format!("combines-{}", info.match_id.unwrap()))
-            } else {
-                info.match_id
-            };
-            info
+            get_core_match(id, pool, filename, &args).await?
         }
         None => {
             println!("Cannot parse match id from filename, using args...");
@@ -147,19 +141,17 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 return Err(anyhow!("--match_day arg not provided, skipping..."));
             };
             MatchInfo {
-                match_id: Some(filename.to_string()),
+                match_id: filename.to_string(),
                 tier,
                 season: i32::from(season),
                 match_day,
                 is_series: false,
                 match_date: None,
-                is_combine,
                 match_type: if is_combine {
                     "Combine".to_owned()
                 } else {
                     "Regulation".to_owned()
                 },
-                demo_url: None,
             }
         }
     };
@@ -192,7 +184,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
     };
     let body = StatsRequestBody {
         path: req_path,
-        match_id: format!("{}{}", match_info.match_id.unwrap(), map_num_str),
+        match_id: format!("{}{}", match_info.match_id, map_num_str),
         season: match_info.season,
         tier: match_info.tier,
         match_day: match_info.match_day,
@@ -228,105 +220,130 @@ struct StatsRequestBody {
     fix_core_scores: bool,
     fix_team_names: bool,
 }
-#[derive(Debug, FromRow, Clone)]
+#[derive(Debug, Clone)]
 struct MatchInfo {
-    match_id: Option<String>,
+    match_id: String,
     season: i32,
     tier: String,
     match_day: String,
     is_series: bool,
     match_date: Option<String>,
-    is_combine: bool,
     match_type: String,
-    demo_url: Option<String>,
 }
 
 #[derive(Debug, FromRow, Clone)]
-struct CombineMatchInfo {
-    match_id: Option<String>,
-    season: Option<i32>,
-    tier: String,
-    match_date: Option<String>,
+struct CoreMatch {
+    id: i64,
+    stats_match_id: String,
     match_type: String,
+    is_playoff: bool,
+    is_bo3: bool,
+    season: i32,
+    tier: Option<String>,
+    match_day: Option<String>,
+    match_date: Option<String>,
     demo_url: Option<String>,
 }
 
 async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> Result<MatchInfo> {
-    let league_match = sqlx::query_as::<_, MatchInfo>(
+    // Legacy Combine ids (pre-merge filenames) can equal a regulation id, so both rows can match.
+    let candidates = sqlx::query_as::<_, CoreMatch>(
         r#"
-        select mm.id::varchar as match_id,
+        select mm.id,
+               mm.stats_match_id,
+               mm.match_type,
+               mm.is_playoff,
+               mm.is_bo3,
                ls.number as season,
-               pt.name as tier,
-               is_bo3 as is_series,
+               case when mm.match_type = 'REGULATION' then ht_tier.name else mm_tier.name end as tier,
                lm.number as match_day,
-               to_char(coalesce(mm.completed_at, mm.scheduled_date) AT TIME ZONE 'UTC',
+               to_char(case when mm.match_type = 'REGULATION'
+                            then coalesce(mm.completed_at, mm.scheduled_date)
+                            when mm.match_type in ('COMBINE', 'FA_COLO')
+                            then coalesce(mm.game_finished_at, mm.scheduled_date)
+                            else mm.scheduled_date
+                       end AT TIME ZONE 'UTC',
                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as match_date,
-               false as is_combine,
-               case when mm.is_playoff then 'Playoff' else 'Regulation' end::text as match_type,
                mm.demo_url
             from matches_matches mm
-                join leagues_matchday lm on lm.id = mm.match_day_id
-                join leagues_seasons ls on ls.id = lm.season_id
-                join teams_teams ht on mm.home_id = ht.id
-                join teams_teams at on mm.away_id = at.id
-                join players_tiers pt on ht.tier_id = pt.id
-        where mm.id = $1;
+                join leagues_seasons ls on ls.id = mm.season_id
+                left join leagues_matchday lm on lm.id = mm.match_day_id
+                left join teams_teams ht on ht.id = mm.home_id
+                left join players_tiers ht_tier on ht_tier.id = ht.tier_id
+                left join players_tiers mm_tier on mm_tier.id = mm.tier_id
+        where mm.id = $1 or mm.legacy_combine_id = $1;
     "#,
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
 
-    let combine_match = sqlx::query_as::<_, CombineMatchInfo>(
-        r#"
-        select mm.id::varchar as match_id,
-               ls.number as season,
-               pt.name as tier,
-               to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
-                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as match_date,
-               case mm.queue_mode
-                 when 'fa_colo' then 'FAColo'
-                 else 'Combine'
-               end::text as match_type,
-               mm.demo_url
-            from matches_combinematches mm
-                join players_tiers pt on mm.tier_id = pt.id
-                left join leagues_seasons ls on ls.id = mm.season_id
-        where mm.id = $1;
-    "#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let (league, combine) = split_candidates(id, &candidates)?;
+    let selected = match select_match_source(id, league, combine, filename, args)? {
+        MatchSource::League => league.expect("selected league match must exist"),
+        MatchSource::Combine => combine.expect("selected combine match must exist"),
+    };
+    match_info(selected)
+}
 
-    match select_match_source(
-        id,
-        league_match.as_ref(),
-        combine_match.as_ref(),
-        filename,
-        args,
-    )? {
-        MatchSource::League => Ok(league_match.expect("selected league match must exist")),
-        MatchSource::Combine => {
-            let combine = combine_match.expect("selected combine match must exist");
-            let season = combine.season.or(args.season.map(i32::from)).ok_or_else(|| {
-                anyhow!(
-                    "Core combine match {id} has no persisted season; provide --season for this legacy row"
-                )
-            })?;
-            Ok(MatchInfo {
-                match_id: combine.match_id,
-                season,
-                tier: combine.tier,
-                match_day: String::new(),
-                is_series: false,
-                match_date: combine.match_date,
-                is_combine: true,
-                match_type: combine.match_type,
-                demo_url: combine.demo_url,
-            })
-        }
+fn is_combine_type(match_type: &str) -> bool {
+    matches!(match_type, "COMBINE" | "FA_COLO")
+}
+
+/// Splits the lookup rows into the non-Combine row and the Combine/FA Colo row.
+fn split_candidates(
+    id: i64,
+    candidates: &[CoreMatch],
+) -> Result<(Option<&CoreMatch>, Option<&CoreMatch>)> {
+    let (combines, others): (Vec<_>, Vec<_>) = candidates
+        .iter()
+        .partition(|row| is_combine_type(&row.match_type));
+    if combines.len() > 1 || others.len() > 1 {
+        return Err(anyhow!(
+            "Core match id {id} is ambiguous: {} Combine and {} other rows",
+            combines.len(),
+            others.len()
+        ));
     }
+    Ok((others.first().copied(), combines.first().copied()))
+}
+
+fn stats_match_type(match_type: &str, is_playoff: bool) -> Result<&'static str> {
+    match match_type {
+        "REGULATION" if is_playoff => Ok("Playoff"),
+        "REGULATION" => Ok("Regulation"),
+        "COMBINE" => Ok("Combine"),
+        "FA_COLO" => Ok("FAColo"),
+        other => Err(anyhow!(
+            "Core match type {other} is not imported into Stats"
+        )),
+    }
+}
+
+fn match_info(row: &CoreMatch) -> Result<MatchInfo> {
+    let id = row.id;
+    let match_type = stats_match_type(&row.match_type, row.is_playoff)
+        .map_err(|error| anyhow!("Core match {id}: {error}"))?;
+    let tier = row
+        .tier
+        .clone()
+        .ok_or_else(|| anyhow!("Core match {id} has no tier"))?;
+    let match_day = if is_combine_type(&row.match_type) {
+        String::new()
+    } else {
+        row.match_day
+            .clone()
+            .ok_or_else(|| anyhow!("Core match {id} has no match day"))?
+    };
+    Ok(MatchInfo {
+        match_id: row.stats_match_id.clone(),
+        season: row.season,
+        tier,
+        match_day,
+        is_series: row.is_bo3,
+        match_date: row.match_date.clone(),
+        match_type: match_type.to_owned(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -337,8 +354,8 @@ enum MatchSource {
 
 fn select_match_source(
     id: i64,
-    league: Option<&MatchInfo>,
-    combine: Option<&CombineMatchInfo>,
+    league: Option<&CoreMatch>,
+    combine: Option<&CoreMatch>,
     filename: &str,
     args: &Args,
 ) -> Result<MatchSource> {
@@ -357,7 +374,9 @@ fn select_match_source(
         (Some(_), None) => Ok(MatchSource::League),
         (None, None) => Err(anyhow!("Core match id {id} was not found")),
         (None, Some(combine)) => {
-            if demo_url_matches_filename(combine.demo_url.as_deref(), filename)
+            // A post-merge Combine id is unique; only a legacy id hit needs filename evidence.
+            if combine.id == id
+                || demo_url_matches_filename(combine.demo_url.as_deref(), filename)
                 || filename_indicates_combine(filename)
             {
                 Ok(MatchSource::Combine)
@@ -418,8 +437,8 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        demo_url_matches_filename, legacy_file_is_combine, select_match_source, Args,
-        CombineMatchInfo, MatchInfo, MatchSource,
+        demo_url_matches_filename, legacy_file_is_combine, match_info, select_match_source,
+        split_candidates, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -436,27 +455,33 @@ mod tests {
         }
     }
 
-    fn league(demo_url: Option<&str>) -> MatchInfo {
-        MatchInfo {
-            match_id: Some("8088".to_owned()),
+    fn league(demo_url: Option<&str>) -> CoreMatch {
+        CoreMatch {
+            id: 8088,
+            stats_match_id: "8088".to_owned(),
+            match_type: "REGULATION".to_owned(),
+            is_playoff: false,
+            is_bo3: false,
             season: 20,
-            tier: "Premier".to_owned(),
-            match_day: "M10".to_owned(),
-            is_series: false,
+            tier: Some("Premier".to_owned()),
+            match_day: Some("M10".to_owned()),
             match_date: None,
-            is_combine: false,
-            match_type: "Regulation".to_owned(),
             demo_url: demo_url.map(str::to_owned),
         }
     }
 
-    fn combine(demo_url: Option<&str>) -> CombineMatchInfo {
-        CombineMatchInfo {
-            match_id: Some("8088".to_owned()),
-            season: Some(20),
-            tier: "Premier".to_owned(),
+    /// A merged FA Colo row whose legacy id 8088 collides with the regulation match.
+    fn combine(demo_url: Option<&str>) -> CoreMatch {
+        CoreMatch {
+            id: 19773,
+            stats_match_id: "combines-8088".to_owned(),
+            match_type: "FA_COLO".to_owned(),
+            is_playoff: false,
+            is_bo3: false,
+            season: 20,
+            tier: Some("Premier".to_owned()),
+            match_day: None,
             match_date: None,
-            match_type: "FAColo".to_owned(),
             demo_url: demo_url.map(str::to_owned),
         }
     }
@@ -578,23 +603,65 @@ mod tests {
     }
 
     #[test]
-    fn league_selection_ignores_an_irrelevant_legacy_combine_season() {
-        let league = league(Some(
-            "https://f005.backblazeb2.com/file/csc-demo-archive/s19/M07/s19-M07-PhoFighters-vs-Nightshades-mid8005.7z",
-        ));
-        let mut combine = combine(None);
-        combine.season = None;
+    fn stats_match_type_maps_core_types() {
+        assert_eq!(stats_match_type("REGULATION", false).unwrap(), "Regulation");
+        assert_eq!(stats_match_type("REGULATION", true).unwrap(), "Playoff");
+        assert_eq!(stats_match_type("COMBINE", false).unwrap(), "Combine");
+        assert_eq!(stats_match_type("FA_COLO", false).unwrap(), "FAColo");
+        assert!(stats_match_type("SCRIM", false).is_err());
+        assert!(stats_match_type("PRESEASON", false).is_err());
+    }
 
+    #[test]
+    fn two_candidates_split_and_disambiguate_by_filename() {
+        let league = league(Some(
+            "https://f005.backblazeb2.com/file/csc-demo-archive/s19/M07/s19-M07-PhoFighters-vs-Nightshades-mid8088.7z",
+        ));
+        let rows = [combine(None), league];
+        let (league, combine) = split_candidates(8088, &rows).unwrap();
+        let args = args();
+
+        let pick =
+            |filename| match select_match_source(8088, league, combine, filename, &args).unwrap() {
+                MatchSource::League => league.unwrap(),
+                MatchSource::Combine => combine.unwrap(),
+            };
+        let regulation =
+            match_info(pick("s19-M07-PhoFighters-vs-Nightshades-mid8088.dem")).unwrap();
+        assert_eq!(regulation.match_id, "8088");
+        assert_eq!(regulation.match_type, "Regulation");
+        assert_eq!(regulation.match_day, "M10");
+
+        let fa_colo = match_info(pick("fa-colo-Premier-mid8088-0_de_nuke.dem")).unwrap();
+        // The Stats key keeps the legacy id, never the new Core id.
+        assert_eq!(fa_colo.match_id, "combines-8088");
+        assert_eq!(fa_colo.match_type, "FAColo");
+        assert_eq!(fa_colo.match_day, "");
+    }
+
+    #[test]
+    fn two_rows_of_the_same_kind_are_rejected() {
+        assert!(split_candidates(8088, &[combine(None), combine(None)]).is_err());
+        assert!(split_candidates(8088, &[league(None), league(None)]).is_err());
+    }
+
+    #[test]
+    fn post_merge_combine_id_needs_no_filename_evidence() {
+        let mut combine = combine(None);
+        combine.id = 20001;
+        combine.stats_match_id = "combines-20001".to_owned();
         assert_eq!(
-            select_match_source(
-                8005,
-                Some(&league),
-                Some(&combine),
-                "s19-M07-PhoFighters-vs-Nightshades-mid8005.dem",
-                &args()
-            )
-            .unwrap(),
-            MatchSource::League
+            select_match_source(20001, None, Some(&combine), "renamed-mid20001.dem", &args())
+                .unwrap(),
+            MatchSource::Combine
         );
+        assert_eq!(match_info(&combine).unwrap().match_id, "combines-20001");
+    }
+
+    #[test]
+    fn scrim_rows_are_not_imported() {
+        let mut scrim = league(None);
+        scrim.match_type = "SCRIM".to_owned();
+        assert!(match_info(&scrim).is_err());
     }
 }
