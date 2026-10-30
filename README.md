@@ -285,16 +285,16 @@ scripts/run-backfill-nice.sh \
 ## Combine reparse
 
 `--combines` reparses a season's Combine and FA Colo matches
-(`matches_combinematches`) instead of league matches. These matches have no round-repair concept (there's no
+(`match_type` `COMBINE`/`FA_COLO`) instead of regulation matches. These matches have no round-repair concept (there's no
 per-round `PlayerMatchStats` correction target) and are always a single map,
 so `--combines` behaves like `--full-reparse` — same download/discover/ledger
 machinery, same `/api/add-match` ingest call with `createOnly: false` once
-`--confirm-season` is supplied — just sourced from the combine table. It sends
-`matchType: "Combine"` or `matchType: "FAColo"` from the persisted
-`queue_mode` and prefixes the Stats match id `combines-{id}`, which
-is what CSC-Stats' add-match handler and `stats-importer`'s own single-file
-import mode already use to keep combine imports out of the league-match id
-space.
+`--confirm-season` is supplied. It sends `matchType: "Combine"` or
+`matchType: "FAColo"` from `match_type` and Core's `stats_match_id` as the
+Stats match id (`combines-{legacy id}` for Combines merged into
+`matches_matches`), as single-file imports do. `--match-id` takes the Core id.
+Demos archived before the merge carry the legacy id as `mid{N}`; that counts as
+the match's own id, not a displaced one.
 
 Single-file imports look the filename's `mid{N}` up in `matches_matches` by
 `id` or `legacy_combine_id` and send its `stats_match_id` as the Stats key
@@ -305,8 +305,7 @@ wins; otherwise combine/FA Colo filename markers break ties, with league
 remaining the safe default. A legacy-id-only hit needs one of those markers or
 `--combine`.
 
-Season scoping uses `matches_combinematches.season_id`. The `sNN/` segment in
-`demo_url` is consulted only for legacy rows whose season foreign key is null. A
+Season scoping uses `season_id`. A
 combine with no tier assigned (`tier_id` is nullable, unlike a league match's
 derivable-from-teams tier) is excluded from the season inventory rather than
 downloaded and failed at apply time.
@@ -321,10 +320,10 @@ combination outright instead. It shares `--full-reparse`'s ledger/mode
 semantics (no `--parser-version` requirement, dry-run until
 `--confirm-season` is supplied, resumable via the same JSONL ledger), but
 under distinct `combines-full-reparse`/`combines-full-reparse-dry-run` mode
-strings — `matches_combinematches.id` and `matches_matches.id` are
-independent sequences that can share a numeric id within the same season, and
-the distinct mode string keeps a combine run's ledger/workspace bookkeeping
-from colliding with a league-match run's.
+strings, so a combine run keeps its own ledger file. Ledgers written before the
+Combine merge record the old Combine ids, which don't match the new Core ids:
+those Combines are reparsed again, which is harmless (add-match reparses are
+safe to rerun under the same Stats key).
 
 Dry-run:
 

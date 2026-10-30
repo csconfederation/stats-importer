@@ -58,16 +58,14 @@ pub struct BackfillArgs {
     )]
     full_reparse: bool,
 
-    /// Reparse a season's Combine and FA Colo matches (matches_combinematches)
-    /// instead of league matches (matches_matches). These matches have no round-repair concept
+    /// Reparse a season's Combine and FA Colo matches instead of regulation
+    /// matches. These matches have no round-repair concept
     /// (no per-round stat correction target) and are always a single map, so
     /// this always behaves like --full-reparse: it downloads/discovers demos
     /// and, once --confirm-season is supplied, reparses them through the same
-    /// add-match ingest path used for league matches, with the resulting
-    /// stats match id prefixed `combines-{id}` so CSC-Stats' add-match handler
-    /// treats it as a combine import. matchType follows the persisted queue_mode.
-    /// Season scoping prefers the persisted season_id; the `sNN/` demo_url path
-    /// is used only for legacy rows whose season_id is null.
+    /// add-match ingest path used for league matches, keyed by Core's
+    /// `stats_match_id` (`combines-{legacy id}` for merged rows). matchType
+    /// follows `match_type`. Season scoping uses `season_id`.
     #[arg(
         long,
         conflicts_with_all = ["apply", "direct_apply", "full_reparse", "reviewed_ledger", "reviewed_ledger_sha256", "cached_source_ledger", "cached_source_ledger_sha256", "bo3_only"]
@@ -194,9 +192,12 @@ struct CoreMatch {
     // Absent (NULL/empty) for BO1s and for matches that predate per-map
     // uploads (those got a single bundled archive at demo_url instead).
     s3_keys: Option<Value>,
-    // Present only for rows sourced from matches_combinematches. The stored
-    // value, not an archive filename, decides the Stats match type.
-    queue_mode: Option<String>,
+    // The Stats base key; BO3 maps append `_{n}`.
+    stats_match_id: String,
+    // Pre-merge Combine id: demos archived before the merge carry it as `mid{N}`.
+    legacy_combine_id: Option<i64>,
+    // The stored value, not an archive filename, decides the Stats match type.
+    match_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,9 +304,7 @@ impl BackfillArgs {
         } else if self.apply {
             "apply"
         } else if self.combines {
-            // Distinct mode strings keep combine ledger/workspace bookkeeping
-            // out of the league-match id space; matches_combinematches.id and
-            // matches_matches.id are independent sequences that can collide.
+            // Distinct mode strings keep combine runs in their own ledger file.
             if self.confirm_season.is_some() {
                 "combines-full-reparse"
             } else {
@@ -766,7 +765,9 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit,
                coalesce(sf.scored_map_names, ARRAY[]::text[]) AS scored_map_names,
                dps.s3_keys AS s3_keys,
-               NULL::text AS queue_mode
+               m.stats_match_id,
+               m.legacy_combine_id::bigint AS legacy_combine_id,
+               m.match_type
         FROM matches_matches m
         JOIN leagues_matchday md ON md.id = m.match_day_id
         JOIN leagues_seasons s ON s.id = md.season_id
@@ -778,6 +779,7 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
         LEFT JOIN audit_flags af ON af.match_id = m.id
         LEFT JOIN matches_demoprocessingstatus dps ON dps.match_id = m.id
         WHERE s.number = $1
+          AND m.match_type = 'REGULATION'
         ORDER BY md.scheduled_date, m.id
         "#,
     )
@@ -793,10 +795,12 @@ struct CombineMatchRow {
     demo_url: Option<String>,
     tier: Option<String>,
     match_date: String,
-    queue_mode: String,
+    stats_match_id: String,
+    legacy_combine_id: Option<i64>,
+    match_type: String,
 }
 
-/// Fetches a season's combine matches (matches_combinematches), shaped as
+/// Fetches a season's Combine and FA Colo matches, shaped as
 /// CoreMatch so the rest of the reparse pipeline (discover_demos,
 /// process_match, the Ledger) can be reused unchanged. Combines have no
 /// BO3/round-repair concept: every combine is a single map, so is_bo3 is
@@ -804,11 +808,7 @@ struct CombineMatchRow {
 /// only gate the round-repair path, never taken for combines) are always
 /// false.
 ///
-/// New rows are scoped through CombineMatches.season. The archive-path check is
-/// retained only as an explicit fallback for historical rows whose season_id
-/// is null; it is not used when persisted season data exists.
-///
-/// tier_id is nullable on matches_combinematches (unlike a league match's
+/// tier_id is nullable on Combines (unlike a league match's
 /// tier, which is always derivable from its teams), so this is an inner join:
 /// a combine without a tier can't be reparsed (full_import_request's `tier`
 /// is a required add-match field) and would otherwise download/extract an
@@ -821,19 +821,19 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
         SELECT mm.id AS match_id,
                mm.demo_url,
                pt.name AS tier,
-               mm.queue_mode,
+               mm.stats_match_id,
+               mm.legacy_combine_id::bigint AS legacy_combine_id,
+               mm.match_type,
                to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date
-        FROM matches_combinematches mm
+        FROM matches_matches mm
         JOIN players_tiers pt ON pt.id = mm.tier_id
-        LEFT JOIN leagues_seasons s ON s.id = mm.season_id
-        WHERE mm.cancelled = false
+        JOIN leagues_seasons s ON s.id = mm.season_id
+        WHERE mm.match_type IN ('COMBINE', 'FA_COLO')
+          AND mm.cancelled = false
           AND mm.game_finished = true
           AND mm.demo_url IS NOT NULL
-          AND (
-            s.number = $1 OR
-            (mm.season_id IS NULL AND mm.demo_url ~ ('/s' || $1::text || '/'))
-          )
+          AND s.number = $1
         ORDER BY mm.scheduled_date, mm.id
         "#,
     )
@@ -855,14 +855,13 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
             marked_forfeit: false,
             legacy_one_zero: false,
             has_forfeit_audit: false,
-            // Combines have no matches_demoprocessingstatus row (that table
-            // is keyed to matches_matches, not matches_combinematches), so
-            // there is no s3_keys array to consult; combines always go
-            // through the legacy single-demo_url path, consistent with
-            // being single-map.
+            // Combines are single-map, so they always go through the
+            // legacy single-demo_url path; s3_keys is never consulted.
             scored_map_names: Vec::new(),
             s3_keys: None,
-            queue_mode: Some(row.queue_mode),
+            stats_match_id: row.stats_match_id,
+            legacy_combine_id: row.legacy_combine_id,
+            match_type: row.match_type,
         })
         .collect())
 }
@@ -1173,6 +1172,14 @@ fn checksum_matched_cached_archive(
     Ok(None)
 }
 
+/// A filename id is this match's own when it is the Core id or, for a demo
+/// archived before the Combine merge, its legacy Combine id.
+fn displaced_id(core_match: &CoreMatch, embedded_id: Option<i64>) -> Option<i64> {
+    embedded_id.filter(|value| {
+        *value != core_match.match_id && Some(*value) != core_match.legacy_combine_id
+    })
+}
+
 fn discover_demos(
     extracted: &Path,
     core_match: &CoreMatch,
@@ -1239,7 +1246,7 @@ fn discover_demos(
             .and_then(|captures| captures.get(1))
             .map(|value| value.as_str().parse::<i64>())
             .transpose()?;
-        let displaced_match_id = embedded_id.filter(|value| *value != core_match.match_id);
+        let displaced_match_id = displaced_id(core_match, embedded_id);
         if displaced_match_id.is_some_and(|value| season_match_ids.contains(&value)) {
             bail!(
                 "archive for Core match {} contains demo {} belonging to Core match {} in the same season",
@@ -1256,7 +1263,7 @@ fn discover_demos(
         });
         let (stats_match_id, identity_source) = if !core_match.is_bo3 {
             (
-                core_match.match_id.to_string(),
+                core_match.stats_match_id.clone(),
                 if displaced_match_id.is_some() {
                     "core_id_normalized"
                 } else {
@@ -1269,8 +1276,8 @@ fn discover_demos(
             // the historical map suffix. A displaced ID is accepted only
             // when it does not identify another Core match in this season.
             (
-                format!("{}_{}", core_match.match_id, map_suffix),
-                if embedded_id == core_match.match_id {
+                format!("{}_{}", core_match.stats_match_id, map_suffix),
+                if displaced_id(core_match, Some(embedded_id)).is_none() {
                     "exact_filename"
                 } else {
                     "core_id_normalized"
@@ -1289,7 +1296,7 @@ fn discover_demos(
                     )
                 })?;
             (
-                format!("{}_{}", core_match.match_id, map_number),
+                format!("{}_{}", core_match.stats_match_id, map_number),
                 "core_map_order".to_owned(),
             )
         };
@@ -1365,7 +1372,7 @@ fn discover_single_map_demo(
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str().parse::<i64>())
         .transpose()?;
-    let displaced_match_id = embedded_id.filter(|value| *value != core_match.match_id);
+    let displaced_match_id = displaced_id(core_match, embedded_id);
     if displaced_match_id.is_some_and(|value| season_match_ids.contains(&value)) {
         bail!(
             "s3_keys archive for Core match {} map {} contains demo {} belonging to Core match {} in the same season",
@@ -1379,7 +1386,7 @@ fn discover_single_map_demo(
         checksum: sha256_file(&path)?,
         relative_path: path.strip_prefix(extracted)?.to_string_lossy().to_string(),
         path,
-        stats_match_id: format!("{}_{}", core_match.match_id, map_index),
+        stats_match_id: format!("{}_{}", core_match.stats_match_id, map_index),
         identity_source: "s3_keys_array_order".to_owned(),
         displaced_match_id,
     })
@@ -1483,34 +1490,6 @@ async fn repair_request(
     Ok(value)
 }
 
-/// Computes the add-match `matchId`/`matchType` for a discovered demo. For
-/// combine-shaped matches this applies the `combines-{id}` prefix that CSC-Stats'
-/// `handle-add-match.ts` expects to distinguish combine imports from league
-/// match imports (the same convention main.rs's single-file import path
-/// already applies). The persisted queue_mode selects Combine versus FAColo.
-fn full_import_identity(
-    args: &BackfillArgs,
-    core_match: &CoreMatch,
-    stats_match_id: &str,
-) -> (String, &'static str) {
-    if args.combines {
-        let match_type = match core_match.queue_mode.as_deref() {
-            Some("fa_colo") => "FAColo",
-            _ => "Combine",
-        };
-        (format!("combines-{stats_match_id}"), match_type)
-    } else {
-        (
-            stats_match_id.to_owned(),
-            if core_match.is_playoff {
-                "Playoff"
-            } else {
-                "Regulation"
-            },
-        )
-    }
-}
-
 async fn full_import_request(
     client: &Client,
     args: &BackfillArgs,
@@ -1524,7 +1503,9 @@ async fn full_import_request(
         .tier
         .as_deref()
         .ok_or_else(|| anyhow!("Core match {} has no tier", core_match.match_id))?;
-    let (match_id, match_type) = full_import_identity(args, core_match, &demo.stats_match_id);
+    let match_type = crate::stats_match_type(&core_match.match_type, core_match.is_playoff)
+        .with_context(|| format!("Core match {}", core_match.match_id))?;
+    let match_id = &demo.stats_match_id;
     let body = json!({
         "path": api_path(args, &demo.path)?,
         "matchId": match_id,
@@ -1638,7 +1619,7 @@ async fn process_full_reparse_s3_keys(
         // map_index — CSC-Stats' own zero-based per-map numbering, matching
         // its live-ingest convention (e.g. Core match 8336's maps are
         // stored as 8336_0/8336_1, not 8336_1/8336_2).
-        let stats_match_id = format!("{}_{}", core_match.match_id, map_index);
+        let stats_match_id = format!("{}_{}", core_match.stats_match_id, map_index);
         let url = s3_key_to_url(key)
             .with_context(|| format!("map {map_index} ({map_name}, s3_keys entry {key})"))?;
         let extension = if url.path().to_ascii_lowercase().ends_with(".zip") {
@@ -1932,18 +1913,10 @@ async fn process_match(
             return Ok(());
         }
     };
-    // matches_combinematches.id and matches_matches.id are independent
-    // sequences and can collide numerically; the "combines-" prefix keeps
-    // per-match workspace/archive-cache directories from colliding when a
-    // combine and a league match in the same season share a raw id.
     let match_root = args
         .workspace
         .join(format!("s{}", args.season))
-        .join(if args.combines {
-            format!("combines-{}", core_match.match_id)
-        } else {
-            core_match.match_id.to_string()
-        });
+        .join(core_match.match_id.to_string());
     fs::create_dir_all(&match_root)?;
     let attempt_name = format!(
         "attempt-{}-{}",
@@ -2508,6 +2481,12 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         season_matches(&pool, args.season).await?
     };
     let available: HashSet<i64> = matches.iter().map(|item| item.match_id).collect();
+    // Pre-merge Combine demos carry legacy ids, so the displaced-id guard needs them too.
+    let season_match_ids: HashSet<i64> = matches
+        .iter()
+        .flat_map(|item| [Some(item.match_id), item.legacy_combine_id])
+        .flatten()
+        .collect();
     let mut missing_selected = selected.difference(&available).copied().collect::<Vec<_>>();
     missing_selected.sort_unstable();
     if !missing_selected.is_empty() {
@@ -2581,7 +2560,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             &token,
             &mut ledger,
             &core_match,
-            &available,
+            &season_match_ids,
             reviewed_inventory.as_ref(),
             cached_source_inventory.as_ref(),
         )
@@ -2657,7 +2636,20 @@ mod tests {
             has_forfeit_audit: false,
             scored_map_names: Vec::new(),
             s3_keys: None,
-            queue_mode: None,
+            stats_match_id: id.to_string(),
+            legacy_combine_id: None,
+            match_type: "REGULATION".to_owned(),
+        }
+    }
+
+    /// A merged Combine: new Core id, Stats key and filenames from its legacy id.
+    fn merged_combine(id: i64, legacy_id: i64) -> CoreMatch {
+        CoreMatch {
+            stats_match_id: format!("combines-{legacy_id}"),
+            legacy_combine_id: Some(legacy_id),
+            match_type: "COMBINE".to_owned(),
+            match_day: String::new(),
+            ..core_match(id, false)
         }
     }
 
@@ -2916,11 +2908,7 @@ mod tests {
 
     #[test]
     fn combines_ledger_mode_is_distinct_from_league_full_reparse_mode() {
-        // The ledger dedups on (season, mode, match_id), and
-        // matches_combinematches.id / matches_matches.id are independent
-        // sequences that can numerically collide within the same season.
-        // Distinct mode strings keep a combine run from being mistaken for
-        // (or masking) a league-match run that happens to share an id.
+        // Distinct mode strings keep a combine run in its own ledger file.
         let root = test_path("combines-mode");
         let mut combines_args = backfill_args(&root);
         combines_args.combines = true;
@@ -2933,45 +2921,58 @@ mod tests {
     }
 
     #[test]
-    fn full_import_identity_prefixes_combine_match_ids_and_uses_combine_match_type() {
-        let root = test_path("full-import-identity");
-        let mut combines_args = backfill_args(&root);
-        combines_args.combines = true;
-        let combine_core_match = core_match(8440, false);
-        let (match_id, match_type) =
-            full_import_identity(&combines_args, &combine_core_match, "8440");
-        assert_eq!(match_id, "combines-8440");
-        assert_eq!(match_type, "Combine");
+    fn combine_key_is_the_legacy_stats_key_when_the_core_id_differs() {
+        let season_ids = HashSet::from([18144, 8005]);
+        for filename in [
+            "combine-contender-mid8005-0_de_nuke-2026-05-04_05-56-55.dem",
+            "combine-contender-mid18144-0_de_nuke-2026-11-04_05-56-55.dem",
+        ] {
+            let root = test_path("combine-key");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(filename), b"demo").unwrap();
+            let found = discover_demos(&root, &merged_combine(18144, 8005), &season_ids).unwrap();
+            assert_eq!(found[0].stats_match_id, "combines-8005");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
-        let mut fa_colo = core_match(8441, false);
-        fa_colo.queue_mode = Some("fa_colo".to_owned());
-        let (match_id, match_type) = full_import_identity(&combines_args, &fa_colo, "8441");
-        assert_eq!(match_id, "combines-8441");
-        assert_eq!(match_type, "FAColo");
+    #[test]
+    fn a_legacy_filename_id_is_not_displaced() {
+        let root = test_path("combine-legacy-exact");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("combine-contender-mid8005-0_de_nuke.dem"),
+            b"demo",
+        )
+        .unwrap();
+        let found = discover_demos(
+            &root,
+            &merged_combine(18144, 8005),
+            &HashSet::from([18144, 8005]),
+        )
+        .unwrap();
+        assert_eq!(found[0].displaced_match_id, None);
+        assert_eq!(found[0].identity_source, "core_bo1");
+        fs::remove_dir_all(root).unwrap();
+    }
 
-        // Even if a combine's CoreMatch were mistakenly marked is_bo3 (it
-        // never is in practice: combines are always single-map), --combines
-        // should still win and report "Combine", not "Playoff".
-        let miscoded = core_match(8440, true);
-        let (_, match_type) = full_import_identity(&combines_args, &miscoded, "8440");
-        assert_eq!(match_type, "Combine");
-
-        let league_args = backfill_args(&root);
-        let bo1 = core_match(500, false);
-        let (match_id, match_type) = full_import_identity(&league_args, &bo1, "500");
-        assert_eq!(match_id, "500");
-        assert_eq!(match_type, "Regulation");
-
-        let mut playoff_bo1 = core_match(502, false);
-        playoff_bo1.is_playoff = true;
-        let (_, match_type) = full_import_identity(&league_args, &playoff_bo1, "502");
-        assert_eq!(match_type, "Playoff");
-
-        // is_bo3 alone no longer implies playoff.
-        let bo3 = core_match(501, true);
-        let (match_id, match_type) = full_import_identity(&league_args, &bo3, "501_1");
-        assert_eq!(match_id, "501_1");
-        assert_eq!(match_type, "Regulation");
+    #[test]
+    fn another_legacy_id_in_the_season_still_bails() {
+        let root = test_path("combine-legacy-foreign");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("combine-contender-mid8006-0_de_nuke.dem"),
+            b"demo",
+        )
+        .unwrap();
+        let error = discover_demos(
+            &root,
+            &merged_combine(18144, 8005),
+            &HashSet::from([18144, 8005, 18145, 8006]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("belonging to Core match 8006"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
