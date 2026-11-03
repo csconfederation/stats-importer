@@ -9,7 +9,7 @@ rust-version = "1.88"
 [dependencies]
 clap = { version = "4.1.6", features = ["derive", "env"] }
 dotenvy = "*"
-zip = "0.6.4"
+zip = "9.0.5"
 regex = "*"
 anyhow = "1.0.69"
 thiserror = "1.0.38"
