@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1140,7 +1140,18 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
-    std::io::copy(&mut file, &mut hash)?;
+    // sha2 0.11 hashers no longer implement io::Write, so io::copy can't feed them.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
     Ok(hex::encode(hash.finalize()))
 }
 
@@ -3471,6 +3482,20 @@ mod tests {
         let mixed = discover_demos(&mixed_root, &core, &HashSet::from([456])).unwrap_err();
         assert!(mixed.to_string().contains("mixes suffixed and unnamed"));
         fs::remove_dir_all(mixed_root).unwrap();
+    }
+
+    #[test]
+    fn sha256_file_matches_a_one_shot_digest_across_buffer_boundaries() {
+        let root = test_path("sha256-file");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("data.bin");
+        let data: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data).unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            hex::encode(Sha256::digest(&data))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
