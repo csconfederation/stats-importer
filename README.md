@@ -290,25 +290,28 @@ per-round `PlayerMatchStats` correction target) and are always a single map,
 so `--combines` behaves like `--full-reparse` — same download/discover/ledger
 machinery, same `/api/add-match` ingest call with `createOnly: false` once
 `--confirm-season` is supplied. It sends `matchType: "Combine"` or
-`matchType: "FAColo"` from `match_type` and Core's `stats_match_id` as the
-Stats match id (`combines-{legacy id}` for Combines merged into
-`matches_matches`), as single-file imports do. `--match-id` takes the Core id.
+`matchType: "FAColo"` from `match_type` and the bare Core `id` as the
+Stats match id, as single-file imports do. `--match-id` takes the Core id.
 Demos archived before the merge carry the legacy id as `mid{N}`; that counts as
 the match's own id, not a displaced one.
 
 Single-file imports look the filename's `mid{N}` up in `matches_matches` by
-`id` or `legacy_combine_id` and send its `stats_match_id` as the Stats key
-(`combines-{legacy id}` for merged Combines). A pre-merge Combine filename can
+`id` or `legacy_combine_id` and send the row's `id` as the Stats key (`{id}`;
+BO3 maps `{id}_{n-1}`), so a legacy `mid{L}` Combine file posts its Core id. A pre-merge Combine filename can
 carry a legacy id that equals a regulation id; `--combine` and `--league` pick
 the row explicitly. Without an override, an exact persisted `demo_url` basename
 wins; otherwise combine/FA Colo filename markers break ties, with league
 remaining the safe default. A legacy-id-only hit needs one of those markers or
 `--combine`.
 
-Season scoping uses `season_id`. A
-combine with no tier assigned (`tier_id` is nullable, unlike a league match's
-derivable-from-teams tier) is excluded from the season inventory rather than
-downloaded and failed at apply time.
+Season scoping uses `season_id`. Combine and FA Colo are tierless (#705): the
+importer sends no `tier` for them, even if the Core row still has one.
+Regulation and playoff matches keep the home team's tier.
+
+**Deploy order (Core-planning #703).** Stats keys are bare Core ids. Deploy this
+build only **after** the Stats key rewrite (`combines-*` to bare ids) in the D64
+window. Before the rewrite it posts bare ids that duplicate every Combine; the old
+build must stay stopped until then.
 
 `--combines` is mutually exclusive with `--full-reparse` and the round-repair
 modes (`--apply`/`--direct-apply`) — it selects the match source, not an
@@ -321,9 +324,9 @@ semantics (no `--parser-version` requirement, dry-run until
 `--confirm-season` is supplied, resumable via the same JSONL ledger), but
 under distinct `combines-full-reparse`/`combines-full-reparse-dry-run` mode
 strings, so a combine run keeps its own ledger file. Ledgers written before the
-Combine merge record the old Combine ids, which don't match the new Core ids:
-those Combines are reparsed again, which is harmless (add-match reparses are
-safe to rerun under the same Stats key).
+bare-id change record `combines-*` keys, which don't match the new keys: those
+Combines are reparsed again, which is harmless after the Stats key rewrite
+(add-match reparses are safe to rerun under the same Stats key).
 
 Dry-run:
 
