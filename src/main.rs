@@ -134,8 +134,13 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
             let Some(season) = args.season else {
                 return Err(anyhow!("--season arg not provided, skipping..."));
             };
-            let Some(tier) = args.tier else {
-                return Err(anyhow!("--tier arg not provided, skipping..."));
+            let tier = if is_combine {
+                None
+            } else {
+                Some(
+                    args.tier
+                        .ok_or_else(|| anyhow!("--tier arg not provided, skipping..."))?,
+                )
             };
             let Some(match_day) = args.match_day else {
                 return Err(anyhow!("--match_day arg not provided, skipping..."));
@@ -212,7 +217,8 @@ struct StatsRequestBody {
     path: String,
     match_id: String,
     season: i32,
-    tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
     match_day: String,
     match_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,7 +230,8 @@ struct StatsRequestBody {
 struct MatchInfo {
     match_id: String,
     season: i32,
-    tier: String,
+    // None for Combine/FA Colo (#705); Stats takes no tier for them.
+    tier: Option<String>,
     match_day: String,
     is_series: bool,
     match_date: Option<String>,
@@ -234,7 +241,6 @@ struct MatchInfo {
 #[derive(Debug, FromRow, Clone)]
 struct CoreMatch {
     id: i64,
-    stats_match_id: String,
     match_type: String,
     is_playoff: bool,
     is_bo3: bool,
@@ -250,7 +256,6 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
     let candidates = sqlx::query_as::<_, CoreMatch>(
         r#"
         select mm.id,
-               mm.stats_match_id,
                mm.match_type,
                mm.is_playoff,
                mm.is_bo3,
@@ -324,10 +329,15 @@ fn match_info(row: &CoreMatch) -> Result<MatchInfo> {
     let id = row.id;
     let match_type = stats_match_type(&row.match_type, row.is_playoff)
         .map_err(|error| anyhow!("Core match {id}: {error}"))?;
-    let tier = row
-        .tier
-        .clone()
-        .ok_or_else(|| anyhow!("Core match {id} has no tier"))?;
+    let tier = if is_combine_type(&row.match_type) {
+        None
+    } else {
+        Some(
+            row.tier
+                .clone()
+                .ok_or_else(|| anyhow!("Core match {id} has no tier"))?,
+        )
+    };
     let match_day = if is_combine_type(&row.match_type) {
         String::new()
     } else {
@@ -336,7 +346,7 @@ fn match_info(row: &CoreMatch) -> Result<MatchInfo> {
             .ok_or_else(|| anyhow!("Core match {id} has no match day"))?
     };
     Ok(MatchInfo {
-        match_id: row.stats_match_id.clone(),
+        match_id: id.to_string(),
         season: row.season,
         tier,
         match_day,
@@ -458,7 +468,6 @@ mod tests {
     fn league(demo_url: Option<&str>) -> CoreMatch {
         CoreMatch {
             id: 8088,
-            stats_match_id: "8088".to_owned(),
             match_type: "REGULATION".to_owned(),
             is_playoff: false,
             is_bo3: false,
@@ -474,7 +483,6 @@ mod tests {
     fn combine(demo_url: Option<&str>) -> CoreMatch {
         CoreMatch {
             id: 19773,
-            stats_match_id: "combines-8088".to_owned(),
             match_type: "FA_COLO".to_owned(),
             is_playoff: false,
             is_bo3: false,
@@ -633,8 +641,9 @@ mod tests {
         assert_eq!(regulation.match_day, "M10");
 
         let fa_colo = match_info(pick("fa-colo-Premier-mid8088-0_de_nuke.dem")).unwrap();
-        // The Stats key keeps the legacy id, never the new Core id.
-        assert_eq!(fa_colo.match_id, "combines-8088");
+        // A legacy `mid8088` file posts the row's own Core id, never the legacy id.
+        assert_eq!(fa_colo.match_id, "19773");
+        assert_eq!(fa_colo.tier, None);
         assert_eq!(fa_colo.match_type, "FAColo");
         assert_eq!(fa_colo.match_day, "");
     }
@@ -649,13 +658,36 @@ mod tests {
     fn post_merge_combine_id_needs_no_filename_evidence() {
         let mut combine = combine(None);
         combine.id = 20001;
-        combine.stats_match_id = "combines-20001".to_owned();
         assert_eq!(
             select_match_source(20001, None, Some(&combine), "renamed-mid20001.dem", &args())
                 .unwrap(),
             MatchSource::Combine
         );
-        assert_eq!(match_info(&combine).unwrap().match_id, "combines-20001");
+        assert_eq!(match_info(&combine).unwrap().match_id, "20001");
+    }
+
+    #[test]
+    fn combine_sends_no_tier_but_regulation_keeps_it() {
+        let body = |info: super::MatchInfo| {
+            serde_json::to_value(super::StatsRequestBody {
+                path: String::new(),
+                match_id: info.match_id,
+                season: info.season,
+                tier: info.tier,
+                match_day: info.match_day,
+                match_type: info.match_type,
+                match_date: None,
+                fix_core_scores: false,
+                fix_team_names: false,
+            })
+            .unwrap()
+        };
+        // The Combine row still carries a tier (old Core data).
+        let combine = body(match_info(&combine(None)).unwrap());
+        assert!(combine.get("tier").is_none());
+        assert_eq!(combine["matchId"], "19773");
+        let regulation = body(match_info(&league(None)).unwrap());
+        assert_eq!(regulation["tier"], "Premier");
     }
 
     #[test]

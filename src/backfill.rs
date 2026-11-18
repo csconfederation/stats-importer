@@ -64,7 +64,7 @@ pub struct BackfillArgs {
     /// this always behaves like --full-reparse: it downloads/discovers demos
     /// and, once --confirm-season is supplied, reparses them through the same
     /// add-match ingest path used for league matches, keyed by Core's
-    /// `stats_match_id` (`combines-{legacy id}` for merged rows). matchType
+    /// the bare Core id (`{id}`). matchType
     /// follows `match_type`. Season scoping uses `season_id`.
     #[arg(
         long,
@@ -192,8 +192,6 @@ struct CoreMatch {
     // Absent (NULL/empty) for BO1s and for matches that predate per-map
     // uploads (those got a single bundled archive at demo_url instead).
     s3_keys: Option<Value>,
-    // The Stats base key; BO3 maps append `_{n}`.
-    stats_match_id: String,
     // Pre-merge Combine id: demos archived before the merge carry it as `mid{N}`.
     legacy_combine_id: Option<i64>,
     // The stored value, not an archive filename, decides the Stats match type.
@@ -765,7 +763,6 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(af.has_forfeit_audit, false) AS has_forfeit_audit,
                coalesce(sf.scored_map_names, ARRAY[]::text[]) AS scored_map_names,
                dps.s3_keys AS s3_keys,
-               m.stats_match_id,
                m.legacy_combine_id::bigint AS legacy_combine_id,
                m.match_type
         FROM matches_matches m
@@ -795,7 +792,6 @@ struct CombineMatchRow {
     demo_url: Option<String>,
     tier: Option<String>,
     match_date: String,
-    stats_match_id: String,
     legacy_combine_id: Option<i64>,
     match_type: String,
 }
@@ -808,26 +804,19 @@ struct CombineMatchRow {
 /// only gate the round-repair path, never taken for combines) are always
 /// false.
 ///
-/// tier_id is nullable on Combines (unlike a league match's
-/// tier, which is always derivable from its teams), so this is an inner join:
-/// a combine without a tier can't be reparsed (full_import_request's `tier`
-/// is a required add-match field) and would otherwise download/extract an
-/// archive only to fail at apply time. Excluding it here surfaces the gap as
-/// a missing row in the season's discovered match count rather than a
-/// mid-run failure.
+/// Combines are tierless (#705): `tier` is NULL here and full_import_request
+/// sends none for them, even when old Core rows still carry a tier_id.
 async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
     let rows = sqlx::query_as::<_, CombineMatchRow>(
         r#"
         SELECT mm.id AS match_id,
                mm.demo_url,
-               pt.name AS tier,
-               mm.stats_match_id,
+               NULL::text AS tier,
                mm.legacy_combine_id::bigint AS legacy_combine_id,
                mm.match_type,
                to_char(coalesce(mm.game_finished_at, mm.scheduled_date) AT TIME ZONE 'UTC',
                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS match_date
         FROM matches_matches mm
-        JOIN players_tiers pt ON pt.id = mm.tier_id
         JOIN leagues_seasons s ON s.id = mm.season_id
         WHERE mm.match_type IN ('COMBINE', 'FA_COLO')
           AND mm.cancelled = false
@@ -859,7 +848,6 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
             // legacy single-demo_url path; s3_keys is never consulted.
             scored_map_names: Vec::new(),
             s3_keys: None,
-            stats_match_id: row.stats_match_id,
             legacy_combine_id: row.legacy_combine_id,
             match_type: row.match_type,
         })
@@ -1274,7 +1262,7 @@ fn discover_demos(
         });
         let (stats_match_id, identity_source) = if !core_match.is_bo3 {
             (
-                core_match.stats_match_id.clone(),
+                core_match.match_id.to_string(),
                 if displaced_match_id.is_some() {
                     "core_id_normalized"
                 } else {
@@ -1287,7 +1275,7 @@ fn discover_demos(
             // the historical map suffix. A displaced ID is accepted only
             // when it does not identify another Core match in this season.
             (
-                format!("{}_{}", core_match.stats_match_id, map_suffix),
+                format!("{}_{}", core_match.match_id, map_suffix),
                 if displaced_id(core_match, Some(embedded_id)).is_none() {
                     "exact_filename"
                 } else {
@@ -1307,7 +1295,7 @@ fn discover_demos(
                     )
                 })?;
             (
-                format!("{}_{}", core_match.stats_match_id, map_number),
+                format!("{}_{}", core_match.match_id, map_number),
                 "core_map_order".to_owned(),
             )
         };
@@ -1397,7 +1385,7 @@ fn discover_single_map_demo(
         checksum: sha256_file(&path)?,
         relative_path: path.strip_prefix(extracted)?.to_string_lossy().to_string(),
         path,
-        stats_match_id: format!("{}_{}", core_match.stats_match_id, map_index),
+        stats_match_id: format!("{}_{}", core_match.match_id, map_index),
         identity_source: "s3_keys_array_order".to_owned(),
         displaced_match_id,
     })
@@ -1510,21 +1498,27 @@ async fn full_import_request(
     create_only: bool,
 ) -> Result<Value> {
     let stats_url = env::var("STATS_API_URL").context("STATS_API_URL is required")?;
-    let tier = core_match
-        .tier
-        .as_deref()
-        .ok_or_else(|| anyhow!("Core match {} has no tier", core_match.match_id))?;
     let match_type = crate::stats_match_type(&core_match.match_type, core_match.is_playoff)
         .with_context(|| format!("Core match {}", core_match.match_id))?;
+    // Combine/FA Colo are tierless (#705): send no tier, even if Core still has one.
+    let tier = if crate::is_combine_type(&core_match.match_type) {
+        None
+    } else {
+        Some(
+            core_match
+                .tier
+                .as_deref()
+                .ok_or_else(|| anyhow!("Core match {} has no tier", core_match.match_id))?,
+        )
+    };
     let match_id = &demo.stats_match_id;
-    let body = json!({
+    let mut body = json!({
         "path": api_path(args, &demo.path)?,
         "matchId": match_id,
         "matchDay": core_match.match_day,
         "matchType": match_type,
         "matchDate": core_match.match_date,
         "season": args.season,
-        "tier": tier,
         "traceId": format!(
             "historical-recovery-s{}-core{}-stats{}",
             args.season, core_match.match_id, match_id
@@ -1533,6 +1527,9 @@ async fn full_import_request(
         "fixCoreScores": false,
         "fixTeamNames": false,
     });
+    if let Some(tier) = tier {
+        body["tier"] = json!(tier);
+    }
     let response = client
         .post(format!("{}/api/add-match", stats_url.trim_end_matches('/')))
         .bearer_auth(token)
@@ -1630,7 +1627,7 @@ async fn process_full_reparse_s3_keys(
         // map_index — CSC-Stats' own zero-based per-map numbering, matching
         // its live-ingest convention (e.g. Core match 8336's maps are
         // stored as 8336_0/8336_1, not 8336_1/8336_2).
-        let stats_match_id = format!("{}_{}", core_match.stats_match_id, map_index);
+        let stats_match_id = format!("{}_{}", core_match.match_id, map_index);
         let url = s3_key_to_url(key)
             .with_context(|| format!("map {map_index} ({map_name}, s3_keys entry {key})"))?;
         let extension = if url.path().to_ascii_lowercase().ends_with(".zip") {
@@ -2647,16 +2644,14 @@ mod tests {
             has_forfeit_audit: false,
             scored_map_names: Vec::new(),
             s3_keys: None,
-            stats_match_id: id.to_string(),
             legacy_combine_id: None,
             match_type: "REGULATION".to_owned(),
         }
     }
 
-    /// A merged Combine: new Core id, Stats key and filenames from its legacy id.
+    /// A merged Combine: new Core id and Stats key; filenames carry its legacy id.
     fn merged_combine(id: i64, legacy_id: i64) -> CoreMatch {
         CoreMatch {
-            stats_match_id: format!("combines-{legacy_id}"),
             legacy_combine_id: Some(legacy_id),
             match_type: "COMBINE".to_owned(),
             match_day: String::new(),
@@ -2932,7 +2927,7 @@ mod tests {
     }
 
     #[test]
-    fn combine_key_is_the_legacy_stats_key_when_the_core_id_differs() {
+    fn combine_key_is_the_bare_core_id_for_legacy_and_new_filenames() {
         let season_ids = HashSet::from([18144, 8005]);
         for filename in [
             "combine-contender-mid8005-0_de_nuke-2026-05-04_05-56-55.dem",
@@ -2942,7 +2937,7 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             fs::write(root.join(filename), b"demo").unwrap();
             let found = discover_demos(&root, &merged_combine(18144, 8005), &season_ids).unwrap();
-            assert_eq!(found[0].stats_match_id, "combines-8005");
+            assert_eq!(found[0].stats_match_id, "18144");
             fs::remove_dir_all(root).unwrap();
         }
     }
