@@ -323,10 +323,9 @@ combination outright instead. It shares `--full-reparse`'s ledger/mode
 semantics (no `--parser-version` requirement, dry-run until
 `--confirm-season` is supplied, resumable via the same JSONL ledger), but
 under distinct `combines-full-reparse`/`combines-full-reparse-dry-run` mode
-strings, so a combine run keeps its own ledger file. Ledgers written before the
-bare-id change record `combines-*` keys, which don't match the new keys: those
-Combines are reparsed again, which is harmless after the Stats key rewrite
-(add-match reparses are safe to rerun under the same Stats key).
+strings, so a combine run keeps its own ledger file. A ledger marks a match done
+by its Core id, not its Stats key, so a ledger from before the bare-id change
+still skips the Combines it completed. Start a fresh ledger to reparse them.
 
 Dry-run:
 
