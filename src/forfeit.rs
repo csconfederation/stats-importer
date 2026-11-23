@@ -73,10 +73,14 @@ fn parse_scoreline(value: &str) -> Option<(i32, i32)> {
 
 fn legacy_one_zero(row: &MapRow) -> bool {
     matches!((row.home_score, row.away_score), (1, 0) | (0, 1))
-        || row
-            .score
-            .as_deref()
-            .is_some_and(|score| matches!(strip_spaces(score).as_str(), "1-0" | "0-1"))
+        // The score text goes stale after a by-hand reversal (stats overwrite
+        // only home/away), so it counts only while the numeric scores are unset.
+        || (row.home_score == 0
+            && row.away_score == 0
+            && row
+                .score
+                .as_deref()
+                .is_some_and(|score| matches!(strip_spaces(score).as_str(), "1-0" | "0-1")))
 }
 
 /// An audit forfeit only counts while the map still holds the result it wrote.
@@ -284,6 +288,10 @@ mod tests {
         // submission has since overwritten the scores.
         let by_hand = audit(played(9001, 1, 13, 7), true, "13 - 0");
         assert_eq!(skip_reason(&by_hand), None);
+        // Same, for a 0-1 forfeit whose score text is stale.
+        let mut stale_text = audit(played(9001, 1, 7, 13), true, "0 - 1");
+        stale_text.score = Some("0 - 1".to_owned());
+        assert_eq!(skip_reason(&stale_text), None);
     }
 
     #[test]

@@ -3507,6 +3507,43 @@ mod tests {
     }
 
     #[test]
+    fn backfill_maps_demo_suffix_to_core_map_number_before_skipping() {
+        let root = test_path("guard-suffix");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("s20-mid9001-0_de_a.dem"), b"a").unwrap();
+        fs::write(root.join("s20-mid9001-1_de_b.dem"), b"b").unwrap();
+        let mut forfeited = forfeit::test_rows::played(9001, 1, 0, 13);
+        forfeited.is_forfeit = true;
+        let mut core = guarded(
+            9001,
+            &[forfeited, forfeit::test_rows::played(9001, 2, 13, 4)],
+        );
+        core.played_map_numbers = vec![1, 2];
+        core.map_count = 2;
+        let found = discover_demos(&root, &core, &HashSet::from([9001])).unwrap();
+        let (kept, skipped) = split_guarded_demos(found, &core.map_guard);
+        assert_eq!(
+            kept.iter()
+                .map(|d| d.stats_match_id.as_str())
+                .collect::<Vec<_>>(),
+            ["9001_1"]
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0.stats_match_id, "9001_0");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backfill_does_not_skip_a_hand_reversed_forfeit_with_stale_score_text() {
+        let mut row = forfeit::test_rows::played(9001, 1, 7, 13);
+        row.score = Some("0 - 1".to_owned());
+        row.audit_forfeit = true;
+        row.audit_new_score = Some("0 - 1".to_owned());
+        let core = guarded(9001, &[row]);
+        assert_eq!(imported_maps(&core, &[1]), vec![1]);
+    }
+
+    #[test]
     fn bo3_uses_core_map_order_when_the_filename_has_no_identity() {
         let root = test_path("normalize-unnamed");
         fs::create_dir_all(&root).unwrap();

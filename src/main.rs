@@ -170,25 +170,9 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Err(_) => file_path,
     };
 
-    let mut core_map_number = 1;
+    let core_map_number = core_map_number(filename, match_info.is_series)?;
     let map_num_str = if match_info.is_series {
-        let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
-        let map_number = match map_number_re.captures(filename) {
-            Some(captures) => {
-                let c = captures.get(0).unwrap().as_str();
-                let num_char = c.chars().last().unwrap();
-                let map_num = num_char.to_string().parse::<i32>()?;
-                map_num
-            }
-            None => {
-                return Err(anyhow!(
-                    "cannot parse series map number from filename, skipping..."
-                ));
-            }
-        };
-        // The filename suffix is Stats' zero-based map index; Core's map_number is 1-based.
-        core_map_number = map_number + 1;
-        format!("_{}", map_number)
+        format!("_{}", core_map_number - 1)
     } else {
         String::new()
     };
@@ -305,6 +289,20 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
         MatchSource::Combine => combine.expect("selected combine match must exist"),
     };
     match_info(selected)
+}
+
+/// Core's 1-based `map_number` for a file. A series filename carries Stats'
+/// zero-based map index (`-mid9001-1_…` is map 2); a BO1 is always map 1.
+fn core_map_number(filename: &str, is_series: bool) -> Result<i32> {
+    if !is_series {
+        return Ok(1);
+    }
+    let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
+    let captures = map_number_re
+        .captures(filename)
+        .ok_or_else(|| anyhow!("cannot parse series map number from filename, skipping..."))?;
+    let num_char = captures.get(0).unwrap().as_str().chars().last().unwrap();
+    Ok(num_char.to_string().parse::<i32>()? + 1)
 }
 
 /// Why a `--directory` file's map must not import played stats (map-scoped, so
@@ -473,8 +471,9 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        demo_url_matches_filename, direct_import_skip, forfeit, legacy_file_is_combine, match_info,
-        select_match_source, split_candidates, stats_match_type, Args, CoreMatch, MatchSource,
+        core_map_number, demo_url_matches_filename, direct_import_skip, forfeit,
+        legacy_file_is_combine, match_info, select_match_source, split_candidates,
+        stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -754,10 +753,42 @@ mod tests {
     }
 
     #[test]
+    fn directory_import_maps_filename_index_to_core_map_number() {
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-0_de_x.dem", true).unwrap(),
+            1
+        );
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-1_de_x.dem", true).unwrap(),
+            2
+        );
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-0_de_x.dem", false).unwrap(),
+            1
+        );
+        assert!(core_map_number("s20-M01-A-vs-B-mid9001.dem", true).is_err());
+
+        // BO3 with map 2 forfeited: the `-1_` file is skipped, the `-0_` file isn't.
+        let mut forfeited = forfeit::test_rows::played(9001, 2, 0, 13);
+        forfeited.is_forfeit = true;
+        let bo3 = guard(&[forfeit::test_rows::played(9001, 1, 13, 6), forfeited]);
+        let skip = |name: &str| direct_import_skip(&bo3, core_map_number(name, true).unwrap());
+        assert_eq!(skip("s20-M01-A-vs-B-mid9001-0_de_x.dem"), None);
+        assert!(skip("s20-M01-A-vs-B-mid9001-1_de_x.dem").is_some());
+    }
+
+    #[test]
     fn directory_import_does_not_skip_a_reversed_forfeit() {
-        let mut reversed = forfeit::test_rows::played(9001, 1, 0, 0);
-        reversed.audit_new_score = Some("0 - 0".to_owned());
-        assert_eq!(direct_import_skip(&guard(&[reversed]), 1), None);
+        // Reversed by the tool: newest audit row is not a forfeit.
+        let mut by_tool = forfeit::test_rows::played(9001, 1, 0, 0);
+        by_tool.audit_new_score = Some("0 - 0".to_owned());
+        assert_eq!(direct_import_skip(&guard(&[by_tool]), 1), None);
+        // Cleared by hand and replayed: forfeit audit newest, stale score text.
+        let mut by_hand = forfeit::test_rows::played(9001, 1, 7, 13);
+        by_hand.score = Some("0 - 1".to_owned());
+        by_hand.audit_forfeit = true;
+        by_hand.audit_new_score = Some("0 - 1".to_owned());
+        assert_eq!(direct_import_skip(&guard(&[by_hand]), 1), None);
     }
 
     #[test]
