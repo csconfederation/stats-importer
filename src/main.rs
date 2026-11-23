@@ -11,6 +11,7 @@ use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 mod backfill;
+mod forfeit;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -151,6 +152,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 season: i32::from(season),
                 match_day,
                 is_series: false,
+                core_regulation_id: None,
                 match_date: None,
                 match_type: if is_combine {
                     "Combine".to_owned()
@@ -168,6 +170,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Err(_) => file_path,
     };
 
+    let mut core_map_number = 1;
     let map_num_str = if match_info.is_series {
         let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
         let map_number = match map_number_re.captures(filename) {
@@ -183,10 +186,21 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 ));
             }
         };
+        // The filename suffix is Stats' zero-based map index; Core's map_number is 1-based.
+        core_map_number = map_number + 1;
         format!("_{}", map_number)
     } else {
         String::new()
     };
+    if let Some(core_id) = match_info.core_regulation_id {
+        let guard = forfeit::fetch_match_guard(pool, core_id).await?;
+        if let Some(reason) = direct_import_skip(&guard, core_map_number) {
+            return Err(anyhow!(
+                "skipped_forfeit: Core match {core_id} map {core_map_number}: {}",
+                reason.describe()
+            ));
+        }
+    }
     let body = StatsRequestBody {
         path: req_path,
         match_id: format!("{}{}", match_info.match_id, map_num_str),
@@ -234,6 +248,8 @@ struct MatchInfo {
     tier: Option<String>,
     match_day: String,
     is_series: bool,
+    // Core id of a regulation match; the forfeit/void guard only applies to these.
+    core_regulation_id: Option<i64>,
     match_date: Option<String>,
     match_type: String,
 }
@@ -289,6 +305,15 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
         MatchSource::Combine => combine.expect("selected combine match must exist"),
     };
     match_info(selected)
+}
+
+/// Why a `--directory` file's map must not import played stats (map-scoped, so
+/// a BO3's other maps still import).
+fn direct_import_skip(
+    guard: &forfeit::MapGuard,
+    core_map_number: i32,
+) -> Option<forfeit::SkipReason> {
+    guard.skip_reason(core_map_number)
 }
 
 fn is_combine_type(match_type: &str) -> bool {
@@ -351,6 +376,7 @@ fn match_info(row: &CoreMatch) -> Result<MatchInfo> {
         tier,
         match_day,
         is_series: row.is_bo3,
+        core_regulation_id: (!is_combine_type(&row.match_type)).then_some(row.id),
         match_date: row.match_date.clone(),
         match_type: match_type.to_owned(),
     })
@@ -447,8 +473,8 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        demo_url_matches_filename, legacy_file_is_combine, match_info, select_match_source,
-        split_candidates, stats_match_type, Args, CoreMatch, MatchSource,
+        demo_url_matches_filename, direct_import_skip, forfeit, legacy_file_is_combine, match_info,
+        select_match_source, split_candidates, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -695,5 +721,51 @@ mod tests {
         let mut scrim = league(None);
         scrim.match_type = "SCRIM".to_owned();
         assert!(match_info(&scrim).is_err());
+    }
+
+    fn guard(rows: &[forfeit::MapRow]) -> forfeit::MapGuard {
+        forfeit::MapGuard::from_rows(rows)
+    }
+
+    #[test]
+    fn directory_import_allows_adjusted_zero_thirteen_and_bo3_thirteen_zero() {
+        let adjusted = guard(&[forfeit::test_rows::played(6034, 1, 0, 13)]);
+        assert_eq!(direct_import_skip(&adjusted, 1), None);
+        let bo3 = guard(&[
+            forfeit::test_rows::played(9001, 1, 13, 0),
+            forfeit::test_rows::played(9001, 2, 7, 13),
+        ]);
+        assert_eq!(direct_import_skip(&bo3, 1), None);
+        assert_eq!(direct_import_skip(&bo3, 2), None);
+    }
+
+    #[test]
+    fn directory_import_skips_only_the_forfeited_map() {
+        let mut forfeited = forfeit::test_rows::played(9001, 1, 0, 13);
+        forfeited.is_forfeit = true;
+        let bo3 = guard(&[forfeited, forfeit::test_rows::played(9001, 2, 13, 5)]);
+        assert!(direct_import_skip(&bo3, 1).is_some());
+        assert_eq!(direct_import_skip(&bo3, 2), None);
+        let legacy = guard(&[forfeit::test_rows::played(9003, 1, 0, 1)]);
+        assert_eq!(
+            direct_import_skip(&legacy, 1),
+            Some(forfeit::SkipReason::LegacyOneZero)
+        );
+    }
+
+    #[test]
+    fn directory_import_does_not_skip_a_reversed_forfeit() {
+        let mut reversed = forfeit::test_rows::played(9001, 1, 0, 0);
+        reversed.audit_new_score = Some("0 - 0".to_owned());
+        assert_eq!(direct_import_skip(&guard(&[reversed]), 1), None);
+    }
+
+    #[test]
+    fn directory_import_skips_reviewed_void_maps() {
+        let void = guard(&[forfeit::test_rows::played(7339, 1, 0, 0)]);
+        assert_eq!(
+            direct_import_skip(&void, 1),
+            Some(forfeit::SkipReason::ReviewedVoid)
+        );
     }
 }
