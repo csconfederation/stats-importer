@@ -22,6 +22,7 @@ use tokio::{fs::File, io::AsyncWriteExt, time::sleep};
 use walkdir::WalkDir;
 
 use crate::forfeit::{self, MapGuard, SkipReason};
+use crate::stats_demos::{self, MapArtifact};
 
 const B2_HOST: &str = "f005.backblazeb2.com";
 const B2_PATH_PREFIX: &str = "/file/csc-demo-archive/";
@@ -198,6 +199,10 @@ struct CoreMatch {
     // Absent (NULL/empty) for BO1s and for matches that predate per-map
     // uploads (those got a single bundled archive at demo_url instead).
     s3_keys: Option<Value>,
+    // matches_demoprocessingstatus.stats_demos: the per-map recordings in map
+    // order, a map without one keeping its position. Preferred over s3_keys
+    // (which also archives restarts) when present; see stats_demos.rs.
+    stats_demos: Option<Value>,
     // Pre-merge Combine id: demos archived before the merge carry it as `mid{N}`.
     legacy_combine_id: Option<i64>,
     // The stored value, not an archive filename, decides the Stats match type.
@@ -762,6 +767,7 @@ async fn season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMatch>> {
                coalesce(sf.scored_map_names, ARRAY[]::text[]) AS scored_map_names,
                coalesce(sf.scored_map_numbers, ARRAY[]::integer[]) AS scored_map_numbers,
                dps.s3_keys AS s3_keys,
+               dps.stats_demos AS stats_demos,
                m.legacy_combine_id::bigint AS legacy_combine_id,
                m.match_type
         FROM matches_matches m
@@ -849,6 +855,7 @@ async fn combine_season_matches(pool: &PgPool, season: i32) -> Result<Vec<CoreMa
             scored_map_names: Vec::new(),
             scored_map_numbers: Vec::new(),
             s3_keys: None,
+            stats_demos: None,
             legacy_combine_id: row.legacy_combine_id,
             match_type: row.match_type,
         })
@@ -953,7 +960,11 @@ fn s3_key_to_url(key: &str) -> Result<Url> {
 ///   key must contain its position's map name; a mismatch here is exactly
 ///   the class of silent per-map mis-assignment this s3_keys path exists to
 ///   prevent, so it is also terminal rather than best-effort.
-fn validate_s3_key_order(s3_keys: &[String], core_match: &CoreMatch) -> Result<()> {
+///
+/// Returns each key's resolved map. Here the Stats id suffix is the key's
+/// position (Core's own legacy `stats_key` indexes `demo_paths` by position),
+/// while the Core map number comes from `scored_map_numbers`.
+fn validate_s3_key_order(s3_keys: &[String], core_match: &CoreMatch) -> Result<Vec<MapArtifact>> {
     if s3_keys.len() != core_match.scored_map_names.len() {
         bail!(
             "s3_keys has {} entries but Core records {} scored map(s) ({:?})",
@@ -981,7 +992,39 @@ fn validate_s3_key_order(s3_keys: &[String], core_match: &CoreMatch) -> Result<(
             );
         }
     }
-    Ok(())
+    s3_keys
+        .iter()
+        .zip(&core_match.scored_map_names)
+        .enumerate()
+        .map(|(index, (key, map_name))| {
+            Ok(MapArtifact {
+                stats_index: index,
+                core_map_number: core_match
+                    .scored_map_numbers
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| anyhow!("no Core map number for scored map {index}"))?,
+                key: key.clone(),
+                map_name: map_name.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Per-map archives for `--full-reparse`: Core's `stats_demos` when every
+/// recording is keyed (it keeps a forfeited, unrecorded map's position), else
+/// the legacy `s3_keys` list. Empty when the match has neither.
+fn map_artifacts(core_match: &CoreMatch) -> Result<Vec<MapArtifact>> {
+    if let Some(entries) = stats_demos::parse(core_match.stats_demos.as_ref())? {
+        if stats_demos::all_keyed(&entries) {
+            return stats_demos::artifacts(&entries, &core_match.map_guard);
+        }
+    }
+    let s3_keys = parse_s3_keys(core_match.s3_keys.as_ref())?;
+    if s3_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_s3_key_order(&s3_keys, core_match)
 }
 
 async fn download_archive(
@@ -1318,13 +1361,13 @@ fn discover_demos(
 }
 
 /// Discovers the single demo inside one `s3_keys`-derived per-map archive.
-/// Map order here comes from the archive's position in the `s3_keys` array
-/// (`map_index`, zero-based), not from any digit in the filename — the
+/// Map order here comes from the archive's resolved `MapArtifact` (its
+/// position in `stats_demos`/`s3_keys`), not from any digit in the filename — the
 /// per-map zip filenames embed a `-{N}_` index that is known to repeat
 /// across different maps in some matches (Core-planning#242 item 2) and
 /// must not be used for ordering.
 ///
-/// `stats_match_id` is built as `{match_id}_{map_index}`, matching
+/// `stats_match_id` is built as `{match_id}_{stats_index}`, matching
 /// CSC-Stats' own zero-based per-map numbering convention (confirmed
 /// against real data: e.g. Core match 8336's live-ingested maps are stored
 /// as `8336_0`/`8336_1`, not `8336_1`/`8336_2`) — it is *not* Core's
@@ -1338,10 +1381,10 @@ fn discover_demos(
 fn discover_single_map_demo(
     extracted: &Path,
     core_match: &CoreMatch,
-    map_index: usize,
-    core_map_name: &str,
+    artifact: &MapArtifact,
     season_match_ids: &HashSet<i64>,
 ) -> Result<DemoCandidate> {
+    let core_map_name = artifact.map_name.as_str();
     let embedded_match = Regex::new(r"-mid([0-9]+)-")?;
     let mut paths = Vec::new();
     for entry in WalkDir::new(extracted)
@@ -1388,14 +1431,33 @@ fn discover_single_map_demo(
         );
     }
     Ok(DemoCandidate {
-        core_map_number: core_match.scored_map_numbers.get(map_index).copied(),
+        core_map_number: Some(artifact.core_map_number),
         checksum: sha256_file(&path)?,
         relative_path: path.strip_prefix(extracted)?.to_string_lossy().to_string(),
         path,
-        stats_match_id: format!("{}_{}", core_match.match_id, map_index),
+        stats_match_id: format!("{}_{}", core_match.match_id, artifact.stats_index),
         identity_source: "s3_keys_array_order".to_owned(),
         displaced_match_id,
     })
+}
+
+/// Terminal `skipped_forfeit` for a match whose every played map is a
+/// forfeit/void map. A BO3 reaches this only after its demos were resolved to
+/// maps: a map reversed through Core's mutation (0-0, no winner) looks unplayed
+/// until a demo is found for it.
+fn append_forfeit_skip(
+    args: &BackfillArgs,
+    ledger: &mut Ledger,
+    core_match: &CoreMatch,
+) -> Result<()> {
+    ledger.append(event(
+        args,
+        core_match.match_id,
+        "skipped_forfeit",
+        None,
+        Some("every played Core map is a forfeit or reviewed void map".to_owned()),
+        Some(skipped_maps_evidence(&core_match.map_guard)),
+    ))
 }
 
 fn skipped_maps_evidence(guard: &MapGuard) -> Value {
@@ -1659,7 +1721,7 @@ async fn process_full_reparse_s3_keys(
     ledger: &mut Ledger,
     core_match: &CoreMatch,
     season_match_ids: &HashSet<i64>,
-    s3_keys: &[String],
+    artifacts: &[MapArtifact],
 ) -> Result<()> {
     let match_root = args
         .workspace
@@ -1678,18 +1740,16 @@ async fn process_full_reparse_s3_keys(
 
     let mut demos = Vec::new();
     let mut archive_evidence = Vec::new();
-    for (map_index, key) in s3_keys.iter().enumerate() {
-        // validate_s3_key_order already proved core_match.scored_map_names
-        // has the same length as s3_keys and that this key contains this
-        // position's map name.
-        let map_name = &core_match.scored_map_names[map_index];
-        // Map-scoped guard: skip a forfeit/void map before downloading it; the
-        // series' other maps still import.
-        if let Some(reason) = core_match
-            .scored_map_numbers
-            .get(map_index)
-            .and_then(|map_number| core_match.map_guard.skip_reason(*map_number))
-        {
+    for artifact in artifacts {
+        let MapArtifact {
+            stats_index: map_index,
+            core_map_number,
+            key,
+            map_name,
+        } = artifact;
+        // Map-scoped guard on the resolved Core map: skip a forfeit/void map
+        // before downloading it; the series' other maps still import.
+        if let Some(reason) = core_match.map_guard.skip_reason(*core_map_number) {
             ledger.append(event(
                 args,
                 core_match.match_id,
@@ -1700,10 +1760,10 @@ async fn process_full_reparse_s3_keys(
             ))?;
             continue;
         }
-        // stats_match_id (built inside discover_single_map_demo) uses
-        // map_index — CSC-Stats' own zero-based per-map numbering, matching
-        // its live-ingest convention (e.g. Core match 8336's maps are
-        // stored as 8336_0/8336_1, not 8336_1/8336_2).
+        // stats_match_id (built inside discover_single_map_demo) uses the
+        // artifact's zero-based Stats index, matching its live-ingest
+        // convention (e.g. Core match 8336's maps are stored as
+        // 8336_0/8336_1, not 8336_1/8336_2).
         let stats_match_id = format!("{}_{}", core_match.match_id, map_index);
         let url = s3_key_to_url(key)
             .with_context(|| format!("map {map_index} ({map_name}, s3_keys entry {key})"))?;
@@ -1751,13 +1811,7 @@ async fn process_full_reparse_s3_keys(
         )?;
         let extracted = map_workspace.join("extracted");
         extract_archive(&archive_path, &extracted)?;
-        let demo = discover_single_map_demo(
-            &extracted,
-            core_match,
-            map_index,
-            map_name,
-            season_match_ids,
-        )?;
+        let demo = discover_single_map_demo(&extracted, core_match, artifact, season_match_ids)?;
         debug_assert_eq!(demo.stats_match_id, stats_match_id);
         archive_evidence.push(json!({
             "mapIndex": map_index,
@@ -1769,14 +1823,18 @@ async fn process_full_reparse_s3_keys(
     }
 
     if demos.is_empty() {
-        ledger.append(event(
-            args,
-            core_match.match_id,
-            "skipped_not_repairable",
-            None,
-            Some("no demos discovered across s3_keys archives".to_owned()),
-            None,
-        ))?;
+        if core_match.map_guard.whole_match_skipped() {
+            append_forfeit_skip(args, ledger, core_match)?;
+        } else {
+            ledger.append(event(
+                args,
+                core_match.match_id,
+                "skipped_not_repairable",
+                None,
+                Some("no demos discovered across s3_keys archives".to_owned()),
+                None,
+            ))?;
+        }
         attempt_workspace.finish(args.keep_successful || args.keep_all)?;
         return Ok(());
     }
@@ -1849,16 +1907,11 @@ async fn process_match(
     reviewed_inventory: Option<&ReviewedInventory>,
     cached_source_inventory: Option<&CachedSourceInventory>,
 ) -> Result<()> {
-    if core_match.map_guard.whole_match_skipped() {
+    // A BO3 decides this after its demos are resolved to maps (below): a map
+    // reversed through Core's mutation reads as unplayed until its demo is found.
+    if !core_match.is_bo3 && core_match.map_guard.whole_match_skipped() {
         verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
-        ledger.append(event(
-            args,
-            core_match.match_id,
-            "skipped_forfeit",
-            None,
-            Some("every played Core map is a forfeit or reviewed void map".to_owned()),
-            Some(skipped_maps_evidence(&core_match.map_guard)),
-        ))?;
+        append_forfeit_skip(args, ledger, core_match)?;
         return Ok(());
     }
     // --full-reparse only, and BO3 only: prefer the canonical per-map
@@ -1893,8 +1946,8 @@ async fn process_match(
     // (non-terminal) ledger event and falls through to the legacy demo_url
     // path below, same as a match with no s3_keys at all.
     if args.full_reparse && core_match.is_bo3 {
-        let s3_keys = match parse_s3_keys(core_match.s3_keys.as_ref()) {
-            Ok(keys) => keys,
+        let artifacts = match map_artifacts(core_match) {
+            Ok(artifacts) => artifacts,
             Err(error) => {
                 ledger.append(event(
                     args,
@@ -1902,52 +1955,38 @@ async fn process_match(
                     "s3_keys_mismatch",
                     None,
                     Some(format!(
-                        "s3_keys is malformed: {error:#}; falling back to the legacy demo_url path for this match"
+                        "{error:#}; falling back to the legacy demo_url path for this match"
                     )),
-                    None,
+                    Some(json!({
+                        "coreScoredMapNames": core_match.scored_map_names,
+                        "s3Keys": core_match.s3_keys,
+                        "statsDemos": core_match.stats_demos,
+                    })),
                 ))?;
                 Vec::new()
             }
         };
-        if !s3_keys.is_empty() {
-            match validate_s3_key_order(&s3_keys, core_match) {
-                Ok(()) => {
-                    // A validated-but-then-unreachable s3_keys archive
-                    // (e.g. a 404 from the archival-migration issue seen on
-                    // match 9275, or any other download/extract/discover
-                    // failure) also falls back rather than failing the
-                    // whole match: some season-19 matches with a complete,
-                    // ordered s3_keys array (e.g. match 8334) have per-map
-                    // zips that 404 while their bundled demo_url archive
-                    // still serves fine, so treating this the same as a
-                    // validation mismatch avoids regressing a match that
-                    // reparses correctly today.
-                    match process_full_reparse_s3_keys(
-                        args,
-                        client,
-                        token,
-                        ledger,
-                        core_match,
-                        season_match_ids,
-                        &s3_keys,
-                    )
-                    .await
-                    {
-                        Ok(()) => return Ok(()),
-                        Err(error) => {
-                            ledger.append(event(
-                                args,
-                                core_match.match_id,
-                                "s3_keys_mismatch",
-                                None,
-                                Some(format!(
-                                    "s3_keys archive(s) unusable ({error:#}); falling back to the legacy demo_url path for this match"
-                                )),
-                                None,
-                            ))?;
-                        }
-                    }
-                }
+        if !artifacts.is_empty() {
+            // A validated-but-then-unreachable archive (e.g. a 404 from the
+            // archival-migration issue seen on match 9275, or any other
+            // download/extract/discover failure) also falls back rather than
+            // failing the whole match: some season-19 matches with a
+            // complete, ordered s3_keys array (e.g. match 8334) have per-map
+            // zips that 404 while their bundled demo_url archive still serves
+            // fine, so treating this the same as a validation mismatch avoids
+            // regressing a match that reparses correctly today.
+            match process_full_reparse_s3_keys(
+                args,
+                client,
+                token,
+                ledger,
+                core_match,
+                season_match_ids,
+                &artifacts,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     ledger.append(event(
                         args,
@@ -1955,19 +1994,19 @@ async fn process_match(
                         "s3_keys_mismatch",
                         None,
                         Some(format!(
-                            "{error:#}; falling back to the legacy demo_url path for this match"
+                            "s3_keys archive(s) unusable ({error:#}); falling back to the legacy demo_url path for this match"
                         )),
-                        Some(json!({
-                            "s3KeysCount": s3_keys.len(),
-                            "coreScoredMapNames": core_match.scored_map_names,
-                            "s3Keys": s3_keys,
-                        })),
+                        None,
                     ))?;
                 }
             }
         }
     }
     let Some(raw_url) = &core_match.demo_url else {
+        if core_match.map_guard.whole_match_skipped() {
+            verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
+            return append_forfeit_skip(args, ledger, core_match);
+        }
         verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "artifact_missing")?;
         ledger.append(event(
             args,
@@ -1982,6 +2021,14 @@ async fn process_match(
     let url = match validate_archive_url(raw_url) {
         Ok(url) => url,
         Err(error) => {
+            if core_match.map_guard.whole_match_skipped() {
+                verify_reviewed_terminal(
+                    reviewed_inventory,
+                    core_match.match_id,
+                    "skipped_forfeit",
+                )?;
+                return append_forfeit_skip(args, ledger, core_match);
+            }
             verify_reviewed_terminal(
                 reviewed_inventory,
                 core_match.match_id,
@@ -2125,6 +2172,12 @@ async fn process_match(
     }
 
     let demos = skip_guarded_demos(args, ledger, core_match, demos)?;
+    if demos.is_empty() && core_match.map_guard.whole_match_skipped() {
+        verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
+        append_forfeit_skip(args, ledger, core_match)?;
+        attempt_workspace.finish(args.keep_successful || args.keep_all)?;
+        return Ok(());
+    }
 
     if args.full_reparse || args.combines {
         if demos.is_empty() {
@@ -2722,6 +2775,7 @@ mod tests {
             scored_map_names: Vec::new(),
             scored_map_numbers: Vec::new(),
             s3_keys: None,
+            stats_demos: None,
             legacy_combine_id: None,
             match_type: "REGULATION".to_owned(),
         }
@@ -3327,6 +3381,7 @@ mod tests {
     fn validate_s3_key_order_accepts_matching_length_and_map_names() {
         let mut core = core_match(9223, true);
         core.scored_map_names = vec!["de_nuke".to_owned(), "de_anubis".to_owned()];
+        core.scored_map_numbers = vec![1, 2];
         let keys = vec![
             "s20/M13/....-mid9223-0_de_nuke-....dem.zip".to_owned(),
             "s20/M13/....-mid9223-1_de_anubis-....dem.zip".to_owned(),
@@ -3389,8 +3444,18 @@ mod tests {
     fn validate_s3_key_order_is_case_insensitive() {
         let mut core = core_match(1, true);
         core.scored_map_names = vec!["de_Anubis".to_owned()];
+        core.scored_map_numbers = vec![1];
         let keys = vec!["...DE_ANUBIS...".to_owned()];
         assert!(validate_s3_key_order(&keys, &core).is_ok());
+    }
+
+    fn artifact(stats_index: usize, core_map_number: i32, map_name: &str) -> MapArtifact {
+        MapArtifact {
+            stats_index,
+            core_map_number,
+            key: String::new(),
+            map_name: map_name.to_owned(),
+        }
     }
 
     #[test]
@@ -3408,14 +3473,14 @@ mod tests {
         let demo = discover_single_map_demo(
             &root,
             &core_match(9077, true),
-            1,
-            "de_anubis",
+            &artifact(1, 2, "de_anubis"),
             &HashSet::from([9077]),
         )
         .unwrap();
-        // stats_match_id uses the zero-based map_index (CSC-Stats'
+        // stats_match_id uses the zero-based stats index (CSC-Stats'
         // convention), not any value derived from the map name.
         assert_eq!(demo.stats_match_id, "9077_1");
+        assert_eq!(demo.core_map_number, Some(2));
         assert_eq!(demo.identity_source, "s3_keys_array_order");
         fs::remove_dir_all(root).unwrap();
     }
@@ -3427,8 +3492,7 @@ mod tests {
         assert!(discover_single_map_demo(
             &root,
             &core_match(9077, true),
-            0,
-            "de_anubis",
+            &artifact(0, 1, "de_anubis"),
             &HashSet::from([9077])
         )
         .is_err());
@@ -3437,8 +3501,7 @@ mod tests {
         assert!(discover_single_map_demo(
             &root,
             &core_match(9077, true),
-            0,
-            "de_anubis",
+            &artifact(0, 1, "de_anubis"),
             &HashSet::from([9077])
         )
         .is_err());
@@ -3453,8 +3516,7 @@ mod tests {
         assert!(discover_single_map_demo(
             &root,
             &core_match(9077, true),
-            0,
-            "de_anubis",
+            &artifact(0, 1, "de_anubis"),
             &HashSet::from([9077, 555]),
         )
         .is_err());
@@ -3537,8 +3599,7 @@ mod tests {
     fn backfill_does_not_skip_a_hand_reversed_forfeit_with_stale_score_text() {
         let mut row = forfeit::test_rows::played(9001, 1, 7, 13);
         row.score = Some("0 - 1".to_owned());
-        row.audit_forfeit = true;
-        row.audit_new_score = Some("0 - 1".to_owned());
+        row.has_audit = true;
         let core = guarded(9001, &[row]);
         assert_eq!(imported_maps(&core, &[1]), vec![1]);
     }
@@ -3845,11 +3906,105 @@ mod tests {
     #[test]
     fn backfill_does_not_skip_a_reversed_forfeit_with_audit_history() {
         let mut reversed = forfeit::test_rows::played(9001, 1, 0, 0);
-        reversed.audit_forfeit = false; // newest audit row is the reversal
-        reversed.audit_new_score = Some("0 - 0".to_owned());
+        reversed.has_audit = true;
         let core = guarded(9001, &[reversed]);
         assert!(!core.map_guard.whole_match_skipped());
         assert_eq!(imported_maps(&core, &[1]), vec![1]);
+    }
+
+    fn named_map(match_id: i64, map: i32, home: i32, away: i32, name: &str) -> forfeit::MapRow {
+        forfeit::MapRow {
+            map_name: Some(name.to_owned()),
+            ..forfeit::test_rows::played(match_id, map, home, away)
+        }
+    }
+
+    /// BO3 whose map 1 was forfeited (no recording) and whose maps 2 and 3 were played.
+    fn bo3_map_one_forfeited() -> CoreMatch {
+        let mut forfeited = named_map(9001, 1, 0, 13, "de_anubis");
+        forfeited.is_forfeit = true;
+        let mut core = guarded(
+            9001,
+            &[
+                forfeited,
+                named_map(9001, 2, 13, 5, "de_nuke"),
+                named_map(9001, 3, 9, 13, "de_inferno"),
+            ],
+        );
+        core.scored_map_names = vec!["de_anubis".into(), "de_nuke".into(), "de_inferno".into()];
+        core.scored_map_numbers = vec![1, 2, 3];
+        core
+    }
+
+    #[test]
+    fn bo3_with_a_forfeited_unrecorded_map_one_resolves_maps_two_and_three_from_stats_demos() {
+        let mut core = bo3_map_one_forfeited();
+        core.stats_demos = Some(json!([
+            {"map": null, "demo_path": null, "s3_key": null},
+            {"map": "de_nuke", "demo_path": "/d/b.dem", "s3_key": "s20/M1/b-de_nuke.dem.zip"},
+            {"map": "de_inferno", "demo_path": "/d/c.dem", "s3_key": "s20/M1/c-de_inferno.dem.zip"},
+        ]));
+        // s3_keys holds only the 2 recordings; 3 scored rows would fail the
+        // legacy length check, but stats_demos keeps each map's position.
+        core.s3_keys = Some(json!([
+            "s20/M1/b-de_nuke.dem.zip",
+            "s20/M1/c-de_inferno.dem.zip"
+        ]));
+        assert!(
+            validate_s3_key_order(&parse_s3_keys(core.s3_keys.as_ref()).unwrap(), &core).is_err()
+        );
+        let artifacts = map_artifacts(&core).unwrap();
+        let resolved: Vec<_> = artifacts
+            .iter()
+            .map(|a| (a.stats_index, a.core_map_number, a.map_name.as_str()))
+            .collect();
+        assert_eq!(resolved, [(1, 2, "de_nuke"), (2, 3, "de_inferno")]);
+        // The guard uses the resolved Core map number: neither map is skipped.
+        assert!(artifacts
+            .iter()
+            .all(|a| core.map_guard.skip_reason(a.core_map_number).is_none()));
+        assert_eq!(core.map_guard.skip_reason(1), Some(SkipReason::Forfeit));
+    }
+
+    #[test]
+    fn bo3_stats_demos_with_a_wrong_map_at_a_position_is_rejected() {
+        let mut core = bo3_map_one_forfeited();
+        core.stats_demos = Some(json!([
+            {"map": null, "demo_path": null, "s3_key": null},
+            {"map": "de_inferno", "demo_path": "/d/c.dem", "s3_key": "s20/M1/c-de_inferno.dem.zip"},
+        ]));
+        assert!(map_artifacts(&core).is_err());
+    }
+
+    #[test]
+    fn legacy_s3_keys_resolve_each_key_to_its_scored_map_number() {
+        let mut core = core_match(9001, true);
+        core.scored_map_names = vec!["de_nuke".into(), "de_inferno".into()];
+        core.scored_map_numbers = vec![1, 3];
+        core.s3_keys = Some(json!(["a-de_nuke.zip", "b-de_inferno.zip"]));
+        let resolved: Vec<_> = map_artifacts(&core)
+            .unwrap()
+            .iter()
+            .map(|a| (a.stats_index, a.core_map_number))
+            .collect();
+        assert_eq!(resolved, [(0, 1), (1, 3)]);
+    }
+
+    #[test]
+    fn bo3_whole_match_skip_waits_for_the_resolved_demos() {
+        // Map 1 forfeited; map 2 reversed through Core's mutation: 0-0, no winner.
+        let mut forfeited = forfeit::test_rows::played(9001, 1, 0, 13);
+        forfeited.is_forfeit = true;
+        let mut reversed = forfeit::test_rows::played(9001, 2, 0, 0);
+        reversed.has_winner = false;
+        reversed.has_audit = true;
+        let core = guarded(9001, &[forfeited, reversed]);
+        // The guard alone reads as "nothing left"; BO3 must not act on that
+        // before resolving demos, because map 2's recording is not skipped.
+        assert!(core.map_guard.whole_match_skipped());
+        assert_eq!(imported_maps(&core, &[1, 2]), vec![2]);
+        // Only the forfeited map's demo: nothing kept, so the terminal skip applies.
+        assert!(imported_maps(&core, &[1]).is_empty());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use sqlx::{FromRow, PgPool};
 
 mod backfill;
 mod forfeit;
+mod stats_demos;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -170,14 +171,19 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Err(_) => file_path,
     };
 
-    let core_map_number = core_map_number(filename, match_info.is_series)?;
-    let map_num_str = if match_info.is_series {
-        format!("_{}", core_map_number - 1)
-    } else {
-        String::new()
-    };
+    let mut core_map_number = core_map_number(filename, match_info.is_series)?;
     if let Some(core_id) = match_info.core_regulation_id {
         let guard = forfeit::fetch_match_guard(pool, core_id).await?;
+        if match_info.is_series {
+            let entries = stats_demos::fetch(pool, core_id).await?;
+            core_map_number = resolve_core_map_number(
+                filename,
+                core_map_number,
+                entries.as_deref().unwrap_or_default(),
+                &guard,
+            )
+            .map_err(|error| anyhow!("ambiguous_map: Core match {core_id}: {error}"))?;
+        }
         if let Some(reason) = direct_import_skip(&guard, core_map_number) {
             return Err(anyhow!(
                 "skipped_forfeit: Core match {core_id} map {core_map_number}: {}",
@@ -185,6 +191,11 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
             ));
         }
     }
+    let map_num_str = if match_info.is_series {
+        format!("_{}", core_map_number - 1)
+    } else {
+        String::new()
+    };
     let body = StatsRequestBody {
         path: req_path,
         match_id: format!("{}{}", match_info.match_id, map_num_str),
@@ -303,6 +314,51 @@ fn core_map_number(filename: &str, is_series: bool) -> Result<i32> {
         .ok_or_else(|| anyhow!("cannot parse series map number from filename, skipping..."))?;
     let num_char = captures.get(0).unwrap().as_str().chars().last().unwrap();
     Ok(num_char.to_string().parse::<i32>()? + 1)
+}
+
+/// Core's map for a BO3 file. The filename's `-N_` digit is unreliable (BO3
+/// recordings can share `-0_`, Core-planning #242), so Core's own per-map data
+/// decides: the `stats_demos` entry naming this file, else the one Core map
+/// whose `map_name` the filename contains. When neither identifies one map the
+/// digit is kept only if no map of the match is skipped, since a wrong map could
+/// then only matter to the forfeit guard; otherwise the file is rejected.
+fn resolve_core_map_number(
+    filename: &str,
+    digit_map: i32,
+    entries: &[stats_demos::StatsDemo],
+    guard: &forfeit::MapGuard,
+) -> Result<i32> {
+    let name = normalized_demo_basename(filename);
+    let recorded: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            [&entry.demo_path, &entry.s3_key]
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.rsplit('/').next())
+                .any(|base| normalized_demo_basename(base) == name)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match recorded.as_slice() {
+        [index] => return Ok(i32::try_from(index + 1)?),
+        [] => {}
+        many => {
+            return Err(anyhow!(
+                "{filename} matches {} stats_demos entries ({many:?})",
+                many.len()
+            ))
+        }
+    }
+    match guard.map_numbers_named_in(filename).as_slice() {
+        [number] => Ok(*number),
+        _ if !guard.has_skipped_maps() => Ok(digit_map),
+        candidates => Err(anyhow!(
+            "{filename} cannot be assigned to one Core map (its -N_ digit says map {digit_map}; \
+             map names match {candidates:?}) and the match has forfeit/void maps"
+        )),
+    }
 }
 
 /// Why a `--directory` file's map must not import played stats (map-scoped, so
@@ -472,8 +528,8 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 mod tests {
     use super::{
         core_map_number, demo_url_matches_filename, direct_import_skip, forfeit,
-        legacy_file_is_combine, match_info, select_match_source, split_candidates,
-        stats_match_type, Args, CoreMatch, MatchSource,
+        legacy_file_is_combine, match_info, resolve_core_map_number, select_match_source,
+        split_candidates, stats_demos, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -781,14 +837,108 @@ mod tests {
     fn directory_import_does_not_skip_a_reversed_forfeit() {
         // Reversed by the tool: newest audit row is not a forfeit.
         let mut by_tool = forfeit::test_rows::played(9001, 1, 0, 0);
-        by_tool.audit_new_score = Some("0 - 0".to_owned());
+        by_tool.has_audit = true;
         assert_eq!(direct_import_skip(&guard(&[by_tool]), 1), None);
-        // Cleared by hand and replayed: forfeit audit newest, stale score text.
-        let mut by_hand = forfeit::test_rows::played(9001, 1, 7, 13);
-        by_hand.score = Some("0 - 1".to_owned());
-        by_hand.audit_forfeit = true;
-        by_hand.audit_new_score = Some("0 - 1".to_owned());
-        assert_eq!(direct_import_skip(&guard(&[by_hand]), 1), None);
+        // Cleared by hand and replayed: audited, so the flag decides, whatever
+        // the score (a replay may finish 13-0 or 0-1 again).
+        for (home, away) in [(7, 13), (13, 0), (0, 1)] {
+            let mut by_hand = forfeit::test_rows::played(9001, 1, home, away);
+            by_hand.has_audit = true;
+            assert_eq!(direct_import_skip(&guard(&[by_hand]), 1), None);
+        }
+    }
+
+    fn named(map: i32, name: &str, forfeited: bool) -> forfeit::MapRow {
+        forfeit::MapRow {
+            map_name: Some(name.to_owned()),
+            is_forfeit: forfeited,
+            ..forfeit::test_rows::played(9001, map, 13, 5)
+        }
+    }
+
+    fn recorded(map: &str, file: &str) -> stats_demos::StatsDemo {
+        stats_demos::StatsDemo {
+            map: Some(map.to_owned()),
+            demo_path: Some(format!("/demos/{file}.dem")),
+            s3_key: Some(format!("s20/M1/{file}.dem.zip")),
+        }
+    }
+
+    // BO3 whose map 1 (anubis) was forfeited and whose played map 2 (nuke)
+    // was recorded with the same `-0_` digit as everything else (#242).
+    fn forfeited_map_one() -> forfeit::MapGuard {
+        guard(&[
+            named(1, "de_anubis", true),
+            named(2, "de_nuke", false),
+            named(3, "de_inferno", false),
+        ])
+    }
+
+    #[test]
+    fn duplicate_zero_digit_filenames_resolve_through_stats_demos() {
+        let entries = [
+            stats_demos::StatsDemo {
+                map: None,
+                demo_path: None,
+                s3_key: None,
+            },
+            recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1"),
+            recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts2"),
+        ];
+        let guard = forfeited_map_one();
+        let resolve = |name: &str| resolve_core_map_number(name, 1, &entries, &guard);
+        // The digit says map 1 (forfeited); stats_demos says maps 2 and 3.
+        assert_eq!(
+            resolve("s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem").unwrap(),
+            2
+        );
+        assert_eq!(
+            resolve("s20-M01-A-vs-B-mid9001-0_de_nuke-ts2.dem.zip").unwrap(),
+            3
+        );
+        assert_eq!(direct_import_skip(&guard, 2), None);
+    }
+
+    #[test]
+    fn duplicate_zero_digit_filenames_resolve_through_core_map_names() {
+        let guard = forfeited_map_one();
+        let resolved =
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_nuke.dem", 1, &[], &guard);
+        assert_eq!(resolved.unwrap(), 2);
+        let resolved =
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_anubis.dem", 1, &[], &guard);
+        assert_eq!(resolved.unwrap(), 1);
+        assert!(direct_import_skip(&guard, 1).is_some());
+    }
+
+    #[test]
+    fn ambiguous_filenames_are_rejected_when_a_map_is_forfeited() {
+        let guard = forfeited_map_one();
+        // No map name and no stats_demos entry: the digit alone can't be trusted.
+        assert!(resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_x.dem", 1, &[], &guard).is_err());
+        // Two recordings of the same file name.
+        let twins = [recorded("de_nuke", "dup"), recorded("de_nuke", "dup")];
+        assert!(resolve_core_map_number("dup.dem", 1, &twins, &guard).is_err());
+        // Same map played twice and no recording match.
+        let repeated = guard_with_repeated_map();
+        assert!(resolve_core_map_number("s20-mid9001-0_de_nuke.dem", 1, &[], &repeated).is_err());
+    }
+
+    fn guard_with_repeated_map() -> forfeit::MapGuard {
+        guard(&[
+            named(1, "de_anubis", true),
+            named(2, "de_nuke", false),
+            named(3, "de_nuke", false),
+        ])
+    }
+
+    #[test]
+    fn unresolved_filenames_keep_the_digit_when_nothing_is_forfeited() {
+        let guard = guard(&[named(1, "de_anubis", false), named(2, "de_nuke", false)]);
+        assert_eq!(
+            resolve_core_map_number("s20-mid9001-1_unknown.dem", 2, &[], &guard).unwrap(),
+            2
+        );
     }
 
     #[test]

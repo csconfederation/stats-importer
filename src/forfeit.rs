@@ -17,20 +17,12 @@ use sqlx::{FromRow, PgPool};
 /// (8668, 8763, 8811, 8926) are `is_forfeit = true` in Core.
 const REVIEWED_VOID_MAPS: [(i64, i32); 5] = [(6841, 1), (6881, 1), (6929, 1), (7086, 1), (7339, 1)];
 
-/// D66: adjusted-score maps that DO import played stats. They override only the
-/// audit-history rule (never `is_forfeit` or the void list), so a stray audit
-/// row can't suppress them.
-const D66_ADJUSTED_MAPS: [(i64, i32); 4] = [(6028, 1), (6034, 1), (6039, 1), (6143, 1)];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// `matches_matchstats.is_forfeit`.
     Forfeit,
     /// Legacy `1-0` / `0-1` map score (disciplinary forfeit, pre-flag data).
     LegacyOneZero,
-    /// Latest `matches_matchscoreaudit` row for the map is a forfeit and the
-    /// map still holds that result.
-    ForfeitAudit,
     /// Reviewed D66 void map.
     ReviewedVoid,
 }
@@ -40,7 +32,6 @@ impl SkipReason {
         match self {
             Self::Forfeit => "Core marks the map is_forfeit",
             Self::LegacyOneZero => "map score is a legacy 1-0/0-1 forfeit",
-            Self::ForfeitAudit => "latest Core score audit is an unreversed forfeit",
             Self::ReviewedVoid => "reviewed D66 void map",
         }
     }
@@ -56,19 +47,15 @@ pub struct MapRow {
     pub home_score: i32,
     pub away_score: i32,
     pub score: Option<String>,
+    pub map_name: Option<String>,
     pub has_winner: bool,
-    /// Newest audit row has a `forfeiting_team`. A reversal row names none.
-    pub audit_forfeit: bool,
-    pub audit_new_score: Option<String>,
+    /// Core's score audit has any row for the map: its `is_forfeit` flag is then
+    /// authoritative, and the score is no longer evidence either way.
+    pub has_audit: bool,
 }
 
 fn strip_spaces(value: &str) -> String {
     value.split_whitespace().collect()
-}
-
-fn parse_scoreline(value: &str) -> Option<(i32, i32)> {
-    let (home, away) = value.split_once('-')?;
-    Some((home.trim().parse().ok()?, away.trim().parse().ok()?))
 }
 
 fn legacy_one_zero(row: &MapRow) -> bool {
@@ -83,22 +70,10 @@ fn legacy_one_zero(row: &MapRow) -> bool {
                 .is_some_and(|score| matches!(strip_spaces(score).as_str(), "1-0" | "0-1")))
 }
 
-/// An audit forfeit only counts while the map still holds the result it wrote.
-/// `reverse_match_forfeit` appends a non-forfeit audit row, so the newest row
-/// handles tool reversals. The old by-hand reversal cleared only `is_forfeit`
-/// and left the forfeit audit newest; once a stats submission overwrites the
-/// scores, they no longer match and the map is played.
-fn audit_forfeit_still_holds(row: &MapRow) -> bool {
-    row.audit_forfeit
-        && row
-            .audit_new_score
-            .as_deref()
-            .and_then(parse_scoreline)
-            .is_some_and(|score| score == (row.home_score, row.away_score))
-}
-
 /// Why this map must not import played stats, if it must not. `13-0`/`0-13`
-/// maps are deliberately not a signal.
+/// maps are deliberately not a signal. The `1-0`/`0-1` heuristic is for rows
+/// that predate `is_forfeit`; once an admin edit or reversal is audited (a hand
+/// clear of the flag keeps the old score), the flag alone decides.
 pub fn skip_reason(row: &MapRow) -> Option<SkipReason> {
     let key = (row.match_id, row.map_number);
     if REVIEWED_VOID_MAPS.contains(&key) {
@@ -107,11 +82,8 @@ pub fn skip_reason(row: &MapRow) -> Option<SkipReason> {
     if row.is_forfeit {
         return Some(SkipReason::Forfeit);
     }
-    if legacy_one_zero(row) {
+    if !row.has_audit && legacy_one_zero(row) {
         return Some(SkipReason::LegacyOneZero);
-    }
-    if !D66_ADJUSTED_MAPS.contains(&key) && audit_forfeit_still_holds(row) {
-        return Some(SkipReason::ForfeitAudit);
     }
     None
 }
@@ -121,12 +93,17 @@ pub fn skip_reason(row: &MapRow) -> Option<SkipReason> {
 pub struct MapGuard {
     skipped: BTreeMap<i32, SkipReason>,
     has_unskipped_played_map: bool,
+    /// Core's `map_name` per `map_number`, for maps that have one.
+    map_names: BTreeMap<i32, String>,
 }
 
 impl MapGuard {
     pub fn from_rows(rows: &[MapRow]) -> Self {
         let mut guard = Self::default();
         for row in rows {
+            if let Some(name) = row.map_name.as_deref().filter(|name| !name.is_empty()) {
+                guard.map_names.insert(row.map_number, name.to_owned());
+            }
             match skip_reason(row) {
                 Some(reason) => {
                     guard.skipped.insert(row.map_number, reason);
@@ -151,6 +128,24 @@ impl MapGuard {
         !self.skipped.is_empty() && !self.has_unskipped_played_map
     }
 
+    pub fn has_skipped_maps(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+
+    pub fn map_name(&self, map_number: i32) -> Option<&str> {
+        self.map_names.get(&map_number).map(String::as_str)
+    }
+
+    /// Core map numbers whose map name appears in `filename` (case-insensitive).
+    pub fn map_numbers_named_in(&self, filename: &str) -> Vec<i32> {
+        let filename = filename.to_ascii_lowercase();
+        self.map_names
+            .iter()
+            .filter(|(_, name)| filename.contains(&name.to_ascii_lowercase()))
+            .map(|(number, _)| *number)
+            .collect()
+    }
+
     pub fn skipped_maps(&self) -> impl Iterator<Item = (i32, SkipReason)> + '_ {
         self.skipped.iter().map(|(map, reason)| (*map, *reason))
     }
@@ -164,18 +159,14 @@ const MAP_ROWS_SELECT: &str = r#"
            ms.home_score,
            ms.away_score,
            ms.score,
+           ms.map_name,
            (ms.winner_id IS NOT NULL) AS has_winner,
-           coalesce(a.forfeiting_team_id IS NOT NULL, false) AS audit_forfeit,
-           a.new_score AS audit_new_score
+           EXISTS (
+             SELECT 1 FROM matches_matchscoreaudit sa
+             WHERE sa.match_id = ms.match_id AND sa.map_number = ms.map_number
+           ) AS has_audit
     FROM matches_matchstats ms
     JOIN matches_matches m ON m.id = ms.match_id AND m.match_type = 'REGULATION'
-    LEFT JOIN LATERAL (
-      SELECT sa.forfeiting_team_id, sa.new_score
-      FROM matches_matchscoreaudit sa
-      WHERE sa.match_id = ms.match_id AND sa.map_number = ms.map_number
-      ORDER BY sa.created DESC, sa.id DESC
-      LIMIT 1
-    ) a ON true
 "#;
 
 /// Canonical map rows for every regulation match of a season, by match id.
@@ -227,9 +218,9 @@ pub mod test_rows {
             home_score: home,
             away_score: away,
             score: Some(format!("{home} - {away}")),
+            map_name: None,
             has_winner: true,
-            audit_forfeit: false,
-            audit_new_score: None,
+            has_audit: false,
         }
     }
 }
@@ -239,9 +230,8 @@ mod tests {
     use super::test_rows::played;
     use super::*;
 
-    fn audit(mut row: MapRow, forfeit: bool, new_score: &str) -> MapRow {
-        row.audit_forfeit = forfeit;
-        row.audit_new_score = Some(new_score.to_owned());
+    fn audited(mut row: MapRow) -> MapRow {
+        row.has_audit = true;
         row
     }
 
@@ -250,48 +240,45 @@ mod tests {
         // 6034: official 0-13, manual but not is_forfeit.
         assert_eq!(skip_reason(&played(6034, 1, 0, 13)), None);
         assert_eq!(skip_reason(&played(9001, 1, 13, 0)), None);
+        assert_eq!(skip_reason(&audited(played(6034, 1, 0, 13))), None);
     }
 
     #[test]
-    fn d66_adjusted_map_ignores_a_stray_forfeit_audit_but_not_is_forfeit() {
-        let stray = audit(played(6034, 1, 0, 13), true, "0 - 13");
-        assert_eq!(skip_reason(&stray), None);
-        let mut flagged = stray;
-        flagged.is_forfeit = true;
-        assert_eq!(skip_reason(&flagged), Some(SkipReason::Forfeit));
-    }
-
-    #[test]
-    fn confirmed_forfeits_are_skipped() {
+    fn flagged_forfeits_are_skipped_with_or_without_audit_history() {
         let mut flagged = played(8926, 1, 0, 13);
         flagged.is_forfeit = true;
         assert_eq!(skip_reason(&flagged), Some(SkipReason::Forfeit));
+        assert_eq!(skip_reason(&audited(flagged)), Some(SkipReason::Forfeit));
+    }
+
+    #[test]
+    fn unaudited_legacy_one_zero_maps_are_skipped() {
         assert_eq!(
             skip_reason(&played(9001, 1, 1, 0)),
+            Some(SkipReason::LegacyOneZero)
+        );
+        assert_eq!(
+            skip_reason(&played(9001, 1, 0, 1)),
             Some(SkipReason::LegacyOneZero)
         );
         let mut text_only = played(9001, 1, 0, 0);
         text_only.score = Some("0 - 1".to_owned());
         assert_eq!(skip_reason(&text_only), Some(SkipReason::LegacyOneZero));
-        assert_eq!(
-            skip_reason(&audit(played(9001, 1, 13, 0), true, "13 - 0")),
-            Some(SkipReason::ForfeitAudit)
-        );
     }
 
     #[test]
-    fn reversed_forfeit_with_audit_history_is_not_skipped() {
-        // reverse_match_forfeit: newest audit row names no forfeiting team.
-        let by_tool = audit(played(9001, 1, 0, 0), false, "0 - 0");
-        assert_eq!(skip_reason(&by_tool), None);
-        // Cleared by hand: the forfeit audit is still newest, but a stats
-        // submission has since overwritten the scores.
-        let by_hand = audit(played(9001, 1, 13, 7), true, "13 - 0");
-        assert_eq!(skip_reason(&by_hand), None);
-        // Same, for a 0-1 forfeit whose score text is stale.
-        let mut stale_text = audit(played(9001, 1, 7, 13), true, "0 - 1");
+    fn audited_maps_follow_is_forfeit_not_the_score() {
+        // Hand-cleared 13-0 forfeit: the flag is off, the old score and audit
+        // remain, and a replay can legitimately finish 13-0.
+        assert_eq!(skip_reason(&audited(played(9001, 1, 13, 0))), None);
+        // Audited 0-1 reversal: the flag is off, so the replay may import.
+        assert_eq!(skip_reason(&audited(played(9001, 1, 0, 1))), None);
+        assert_eq!(skip_reason(&audited(played(9001, 1, 1, 0))), None);
+        let mut stale_text = audited(played(9001, 1, 0, 0));
         stale_text.score = Some("0 - 1".to_owned());
         assert_eq!(skip_reason(&stale_text), None);
+        // Reversed by the tool.
+        assert_eq!(skip_reason(&audited(played(9001, 1, 0, 0))), None);
     }
 
     #[test]
