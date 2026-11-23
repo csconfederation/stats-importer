@@ -110,24 +110,33 @@ pub fn normalized_demo_basename(value: &str) -> String {
 
 /// Core's map for one BO3 recording. The `-N_` digit is unreliable (recordings
 /// can share `-0_`, Core-planning #242), and Core lists recordings in path order
-/// when it can't resolve the veto order, so a `stats_demos` position must agree
-/// with the Core map name in the filename. In order:
-/// - the `stats_demos` entry naming this file, if the filename names that
-///   position's Core map; a filename naming only other Core maps is a conflict;
+/// when it can't resolve the veto order, so neither is trusted over Core's map
+/// names. In order:
 /// - the one Core map whose `map_name` the filename contains;
-/// - `fallback_map` (the entry's position, else the digit), only when no map of
-///   the match is skipped.
+/// - if the match has a forfeit/void map, nothing else: reject;
+/// - the `stats_demos` entry naming this file, else `fallback` (the digit or
+///   archive position); when the filename names several Core maps (one map
+///   played twice), the result must be one of them.
 ///
 /// The result decides both the forfeit guard and the Stats id suffix, so
 /// anything else is rejected.
 pub fn resolve_core_map_number(
     filename: &str,
-    digit_map: i32,
+    fallback: Option<i32>,
     entries: &[StatsDemo],
     guard: &MapGuard,
 ) -> Result<i32> {
-    let name = normalized_demo_basename(filename);
     let named = guard.map_numbers_named_in(filename);
+    if let [number] = named.as_slice() {
+        return Ok(*number);
+    }
+    if guard.has_skipped_maps() {
+        bail!(
+            "{filename} names Core map(s) {named:?}, not exactly one, and the match has \
+             forfeit/void maps"
+        );
+    }
+    let name = normalized_demo_basename(filename);
     let recorded: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -139,35 +148,18 @@ pub fn resolve_core_map_number(
         })
         .map(|(index, _)| index)
         .collect();
-    let fallback_map = match recorded.as_slice() {
-        [index] => {
-            let map = i32::try_from(index + 1)?;
-            if named.contains(&map) {
-                return Ok(map);
-            }
-            if !named.is_empty() {
-                bail!(
-                    "{filename} is stats_demos[{index}] (Core map {map}) but names Core map(s) {named:?}"
-                );
-            }
-            map
-        }
-        [] => match named.as_slice() {
-            [number] => return Ok(*number),
-            _ => digit_map,
-        },
+    let map = match recorded.as_slice() {
+        [index] => i32::try_from(index + 1)?,
+        [] => fallback.ok_or_else(|| anyhow!("{filename} has no Core map number"))?,
         many => bail!(
             "{filename} matches {} stats_demos entries ({many:?})",
             many.len()
         ),
     };
-    if guard.has_skipped_maps() {
-        bail!(
-            "{filename} cannot be verified against one Core map (stats_demos/digit say map \
-             {fallback_map}; map names match {named:?}) and the match has forfeit/void maps"
-        );
+    if !named.is_empty() && !named.contains(&map) {
+        bail!("{filename} resolves to Core map {map} but names Core maps {named:?}");
     }
-    Ok(fallback_map)
+    Ok(map)
 }
 
 pub async fn fetch(pool: &PgPool, match_id: i64) -> Result<Option<Vec<StatsDemo>>> {

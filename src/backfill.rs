@@ -535,6 +535,7 @@ fn is_terminal_status(status: &str) -> bool {
         status,
         "match_complete"
             | "skipped_forfeit"
+            | "legacy_gap_rekey_required"
             | "skipped_not_repairable"
             | "artifact_missing"
             | "artifact_unsupported"
@@ -1284,8 +1285,14 @@ fn discover_demos(
         }
     }
 
+    // Malformed stats_demos only loses a fallback: Core's map names still resolve.
     let entries = if core_match.is_bo3 {
-        stats_demos::parse(core_match.stats_demos.as_ref())?.unwrap_or_default()
+        stats_demos::parse(core_match.stats_demos.as_ref())
+            .unwrap_or_else(|error| {
+                eprintln!("[match {}] ignoring {error:#}", core_match.match_id);
+                None
+            })
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -1333,13 +1340,7 @@ fn discover_demos(
             // repeat across maps, so Core's per-map data resolves the map
             // before the guard runs; the Stats id follows the resolved map.
             let digit_map = map_suffix.parse::<i32>()? + 1;
-            let map = stats_demos::resolve_core_map_number(
-                filename,
-                digit_map,
-                &entries,
-                &core_match.map_guard,
-            )
-            .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))?;
+            let map = resolve_bundled_map(filename, Some(digit_map), &entries, core_match)?;
             core_map_number = Some(map);
             (
                 format!("{}_{}", core_match.match_id, map - 1),
@@ -1351,16 +1352,10 @@ fn discover_demos(
                 .to_owned(),
             )
         } else {
-            let map_number = core_match
-                .played_map_numbers
-                .get(index)
-                .copied()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "cannot map unnamed BO3 demo {} to a Core map number",
-                        filename
-                    )
-                })?;
+            // Archive position is only a fallback: sorted filenames need not
+            // follow Core's map order (a forfeited map 1 may sort after map 2).
+            let position = core_match.played_map_numbers.get(index).copied();
+            let map_number = resolve_bundled_map(filename, position, &entries, core_match)?;
             core_map_number = Some(map_number);
             (
                 format!("{}_{}", core_match.match_id, map_number - 1),
@@ -1377,7 +1372,28 @@ fn discover_demos(
             displaced_match_id,
         });
     }
+    let mut seen = HashSet::new();
+    if let Some(duplicate) = demos
+        .iter()
+        .find(|demo| core_match.is_bo3 && !seen.insert(demo.stats_match_id.clone()))
+    {
+        bail!(
+            "ambiguous_map: Core match {}: two demos resolve to {}",
+            core_match.match_id,
+            duplicate.stats_match_id
+        );
+    }
     Ok(demos)
+}
+
+fn resolve_bundled_map(
+    filename: &str,
+    fallback: Option<i32>,
+    entries: &[stats_demos::StatsDemo],
+    core_match: &CoreMatch,
+) -> Result<i32> {
+    stats_demos::resolve_core_map_number(filename, fallback, entries, &core_match.map_guard)
+        .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))
 }
 
 /// Discovers the single demo inside one `s3_keys`-derived per-map archive.
@@ -1465,13 +1481,26 @@ fn discover_single_map_demo(
 /// until a demo is found for it.
 ///
 /// `archive_checksum` is the inspected archive's, when the skip followed
-/// discovery, so a reviewed apply can verify the same archive.
+/// discovery. A reviewed skip that recorded one is reproduced only with that
+/// archive, so a URL removed or broken since review cannot skip it unverified.
 fn append_forfeit_skip(
     args: &BackfillArgs,
     ledger: &mut Ledger,
     core_match: &CoreMatch,
+    reviewed_inventory: Option<&ReviewedInventory>,
     archive_checksum: Option<&str>,
 ) -> Result<()> {
+    verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
+    if let Some(reviewed) = reviewed_inventory
+        .and_then(|inventory| inventory.archive_checksums.get(&core_match.match_id))
+    {
+        if archive_checksum != Some(reviewed.as_str()) {
+            bail!(
+                "reviewed skipped_forfeit verified archive {reviewed}; this apply did not \
+                 (archive checksum differs from reviewed inventory)"
+            );
+        }
+    }
     ledger.append(event(
         args,
         core_match.match_id,
@@ -1852,7 +1881,8 @@ async fn process_full_reparse_s3_keys(
 
     if demos.is_empty() {
         if core_match.map_guard.whole_match_skipped() {
-            append_forfeit_skip(args, ledger, core_match, None)?;
+            // --full-reparse has no reviewed inventory.
+            append_forfeit_skip(args, ledger, core_match, None, None)?;
         } else {
             ledger.append(event(
                 args,
@@ -1938,9 +1968,44 @@ async fn process_match(
     // A BO3 decides this after its demos are resolved to maps (below): a map
     // reversed through Core's mutation reads as unplayed until its demo is found.
     if !core_match.is_bo3 && core_match.map_guard.whole_match_skipped() {
-        verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
-        append_forfeit_skip(args, ledger, core_match, None)?;
-        return Ok(());
+        return append_forfeit_skip(args, ledger, core_match, reviewed_inventory, None);
+    }
+    // Earlier imports numbered a gap series' maps by position (maps 1, 3 as
+    // `_0`, `_1`). Stats replaces only the id it is sent, so writing map 3 as
+    // `_2` would leave `_1` as a duplicate; the legacy ids need a rekey first.
+    if core_match.is_bo3
+        && [
+            &core_match.played_map_numbers,
+            &core_match.scored_map_numbers,
+        ]
+        .into_iter()
+        .any(|numbers| {
+            numbers
+                .iter()
+                .zip(1..)
+                .any(|(number, position)| *number != position)
+        })
+    {
+        verify_reviewed_terminal(
+            reviewed_inventory,
+            core_match.match_id,
+            "legacy_gap_rekey_required",
+        )?;
+        return ledger.append(event(
+            args,
+            core_match.match_id,
+            "legacy_gap_rekey_required",
+            None,
+            Some(format!(
+                "Core match {} map numbers {:?} (scored {:?}) have a gap: Stats may hold a later \
+                 map under a positional id; rekey its legacy Stats ids before importing",
+                core_match.match_id, core_match.played_map_numbers, core_match.scored_map_numbers
+            )),
+            Some(json!({
+                "coreMapNumbers": core_match.played_map_numbers,
+                "scoredMapNumbers": core_match.scored_map_numbers,
+            })),
+        ));
     }
     // --full-reparse only, and BO3 only: prefer the canonical per-map
     // s3_keys array over the legacy single-map demo_url when it is present
@@ -2032,8 +2097,7 @@ async fn process_match(
     }
     let Some(raw_url) = &core_match.demo_url else {
         if core_match.map_guard.whole_match_skipped() {
-            verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
-            return append_forfeit_skip(args, ledger, core_match, None);
+            return append_forfeit_skip(args, ledger, core_match, reviewed_inventory, None);
         }
         verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "artifact_missing")?;
         ledger.append(event(
@@ -2050,12 +2114,7 @@ async fn process_match(
         Ok(url) => url,
         Err(error) => {
             if core_match.map_guard.whole_match_skipped() {
-                verify_reviewed_terminal(
-                    reviewed_inventory,
-                    core_match.match_id,
-                    "skipped_forfeit",
-                )?;
-                return append_forfeit_skip(args, ledger, core_match, None);
+                return append_forfeit_skip(args, ledger, core_match, reviewed_inventory, None);
             }
             verify_reviewed_terminal(
                 reviewed_inventory,
@@ -2201,8 +2260,13 @@ async fn process_match(
 
     let demos = skip_guarded_demos(args, ledger, core_match, demos)?;
     if demos.is_empty() && core_match.map_guard.whole_match_skipped() {
-        verify_reviewed_terminal(reviewed_inventory, core_match.match_id, "skipped_forfeit")?;
-        append_forfeit_skip(args, ledger, core_match, Some(&archive_checksum))?;
+        append_forfeit_skip(
+            args,
+            ledger,
+            core_match,
+            reviewed_inventory,
+            Some(&archive_checksum),
+        )?;
         attempt_workspace.finish(args.keep_successful || args.keep_all)?;
         return Ok(());
     }
@@ -4060,11 +4124,64 @@ mod tests {
         assert_eq!(kept[0].core_map_number, Some(2));
         assert_eq!(kept[0].stats_match_id, "9001_1");
 
-        // stats_demos at a position that contradicts the filename's Core map fails closed.
-        core.stats_demos = Some(json!([
-            {"map": "de_nuke", "demo_path": "/demos/s20-mid9001-0_de_nuke-ts1.dem", "s3_key": null},
-        ]));
-        assert!(discover_demos(&root, &core, &HashSet::from([9001])).is_err());
+        // Core's path-order list puts map 2's recording at index 0 (map 1),
+        // or is malformed: the unique Core map name still decides.
+        for stats_demos in [
+            json!([
+                {"map": "de_nuke", "demo_path": "/demos/s20-mid9001-0_de_nuke-ts1.dem", "s3_key": null},
+            ]),
+            json!({"not": "a list"}),
+        ] {
+            core.stats_demos = Some(stats_demos);
+            let found = discover_demos(&root, &core, &HashSet::from([9001])).unwrap();
+            assert_eq!(found[0].core_map_number, Some(2));
+            assert_eq!(found[0].stats_match_id, "9001_1");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// BO3 whose map 1 (Nuke) was forfeited and whose map 2 (Mirage) was played.
+    fn bo3_nuke_forfeited_mirage_played() -> CoreMatch {
+        let mut forfeited = named_map(9001, 1, 0, 13, "de_nuke");
+        forfeited.is_forfeit = true;
+        let mut core = guarded(9001, &[forfeited, named_map(9001, 2, 13, 5, "de_mirage")]);
+        core.played_map_numbers = vec![1, 2];
+        core.map_count = 2;
+        core
+    }
+
+    #[test]
+    fn unnamed_bundle_resolves_by_core_map_name_not_sort_order() {
+        // `de_mirage.dem` sorts first but is Core map 2; Nuke is the forfeited map 1.
+        let root = test_path("unnamed-bundle-names");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("de_mirage.dem"), b"a").unwrap();
+        fs::write(root.join("de_nuke.dem"), b"b").unwrap();
+        let core = bo3_nuke_forfeited_mirage_played();
+        let found = discover_demos(&root, &core, &HashSet::from([9001])).unwrap();
+        let (kept, skipped) = split_guarded_demos(found, &core.map_guard);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].relative_path, "de_mirage.dem");
+        assert_eq!(kept[0].stats_match_id, "9001_1");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0.relative_path, "de_nuke.dem");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unnamed_bundle_without_map_names_is_ambiguous_beside_a_forfeit() {
+        let root = test_path("unnamed-bundle-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dem"), b"a").unwrap();
+        fs::write(root.join("b.dem"), b"b").unwrap();
+        let core = bo3_nuke_forfeited_mirage_played();
+        let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
+        assert!(format!("{error:#}").contains("ambiguous_map"), "{error:#}");
+        // Two recordings named for one Core map would share its Stats id.
+        fs::rename(root.join("a.dem"), root.join("a_de_mirage.dem")).unwrap();
+        fs::rename(root.join("b.dem"), root.join("b_de_mirage.dem")).unwrap();
+        let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
+        assert!(format!("{error:#}").contains("ambiguous_map"), "{error:#}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4114,6 +4231,124 @@ mod tests {
         assert!(!inventory.archive_checksums.contains_key(&456));
         verify_reviewed_terminal(Some(&inventory), 123, "skipped_forfeit").unwrap();
         verify_reviewed_terminal(Some(&inventory), 456, "skipped_forfeit").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn reviewed_inventory_with(root: &Path, events: &[LedgerEvent]) -> BackfillArgs {
+        let path = root.join("reviewed.jsonl");
+        let content: String = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap() + "\n")
+            .collect();
+        fs::write(&path, &content).unwrap();
+        let mut args = backfill_args(root);
+        args.apply = true;
+        args.confirm_season = Some(args.season);
+        args.reviewed_ledger = Some(path);
+        args.reviewed_ledger_sha256 = Some(hex::encode(Sha256::digest(content.as_bytes())));
+        args
+    }
+
+    async fn run_process_match(
+        args: &BackfillArgs,
+        core: &CoreMatch,
+        reviewed: Option<&ReviewedInventory>,
+    ) -> (Result<()>, Vec<LedgerEvent>) {
+        let path = args.workspace.join("out.jsonl");
+        let _ = fs::remove_file(&path);
+        let mut ledger = Ledger::open(path.clone()).unwrap();
+        let result = process_match(
+            args,
+            &Client::new(),
+            "token",
+            &mut ledger,
+            core,
+            &HashSet::from([core.match_id]),
+            reviewed,
+            None,
+        )
+        .await;
+        let events = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn gap_series_requires_a_legacy_rekey_before_any_import() {
+        let root = test_path("gap-series");
+        fs::create_dir_all(&root).unwrap();
+        let mut core = core_match(456, true);
+        core.played_map_numbers = vec![1, 3];
+        core.scored_map_names = vec!["de_nuke".into(), "de_inferno".into()];
+        core.scored_map_numbers = vec![1, 3];
+        core.s3_keys = Some(json!(["s20/a_de_nuke.dem.zip", "s20/b_de_inferno.dem.zip"]));
+        core.demo_url = Some("https://example.invalid/never-fetched.7z".to_owned());
+        let mut args = backfill_args(&root);
+        args.full_reparse = true;
+        let (result, events) = run_process_match(&args, &core, None).await;
+        result.unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].status, "legacy_gap_rekey_required");
+        let message = events[0].message.as_deref().unwrap();
+        assert!(
+            message.contains("456") && message.contains("[1, 3]"),
+            "{message}"
+        );
+        assert!(is_terminal_status("legacy_gap_rekey_required"));
+
+        // A gap only in the scored maps (map 2 reads unplayed) is the same hazard.
+        core.played_map_numbers = vec![1, 2, 3];
+        let (result, events) = run_process_match(&args, &core, None).await;
+        result.unwrap();
+        assert_eq!(events[0].status, "legacy_gap_rekey_required");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reviewed_forfeit_skip_with_an_archive_checksum_needs_that_archive_on_apply() {
+        let root = test_path("reviewed-forfeit-no-archive");
+        fs::create_dir_all(&root).unwrap();
+        let mut core = bo3_map_one_forfeited();
+        core.match_id = 123;
+        let mut rows = [
+            named_map(123, 1, 0, 13, "de_anubis"),
+            named_map(123, 2, 0, 13, "de_nuke"),
+        ];
+        for row in &mut rows {
+            row.is_forfeit = true;
+        }
+        core.map_guard = MapGuard::from_rows(&rows);
+        core.played_map_numbers = vec![1, 2];
+        core.scored_map_numbers = vec![1, 2];
+        assert!(core.map_guard.whole_match_skipped());
+
+        let mut with_checksum = ledger_event("skipped_forfeit");
+        with_checksum.evidence = Some(forfeit_skip_evidence(&core.map_guard, Some("inspected")));
+        let args = reviewed_inventory_with(&root, &[with_checksum]);
+        let inventory = ReviewedInventory::load(&args).unwrap().unwrap();
+        for demo_url in [None, Some("https://example.invalid/removed.7z".to_owned())] {
+            core.demo_url = demo_url;
+            let (result, events) = run_process_match(&args, &core, Some(&inventory)).await;
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("differs from reviewed inventory"),
+                "{error:#}"
+            );
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        // Control: a reviewed skip that never inspected an archive still applies.
+        let mut without_checksum = ledger_event("skipped_forfeit");
+        without_checksum.evidence = Some(forfeit_skip_evidence(&core.map_guard, None));
+        let args = reviewed_inventory_with(&root, &[without_checksum]);
+        let inventory = ReviewedInventory::load(&args).unwrap().unwrap();
+        core.demo_url = None;
+        let (result, events) = run_process_match(&args, &core, Some(&inventory)).await;
+        result.unwrap();
+        assert_eq!(events[0].status, "skipped_forfeit");
         fs::remove_dir_all(root).unwrap();
     }
 }

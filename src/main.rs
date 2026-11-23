@@ -178,7 +178,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
             let entries = stats_demos::fetch(pool, core_id).await?;
             core_map_number = stats_demos::resolve_core_map_number(
                 filename,
-                core_map_number,
+                Some(core_map_number),
                 entries.as_deref().unwrap_or_default(),
                 &guard,
             )
@@ -824,7 +824,7 @@ mod tests {
             recorded("de_inferno", "s20-M01-A-vs-B-mid9001-0_de_inferno-ts2"),
         ];
         let guard = forfeited_map_one();
-        let resolve = |name: &str| resolve_core_map_number(name, 1, &entries, &guard);
+        let resolve = |name: &str| resolve_core_map_number(name, Some(1), &entries, &guard);
         // The digit says map 1 (forfeited); stats_demos says maps 2 and 3.
         assert_eq!(
             resolve("s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem").unwrap(),
@@ -841,10 +841,14 @@ mod tests {
     fn duplicate_zero_digit_filenames_resolve_through_core_map_names() {
         let guard = forfeited_map_one();
         let resolved =
-            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_nuke.dem", 1, &[], &guard);
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_nuke.dem", Some(1), &[], &guard);
         assert_eq!(resolved.unwrap(), 2);
-        let resolved =
-            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_anubis.dem", 1, &[], &guard);
+        let resolved = resolve_core_map_number(
+            "s20-M01-A-vs-B-mid9001-0_de_anubis.dem",
+            Some(1),
+            &[],
+            &guard,
+        );
         assert_eq!(resolved.unwrap(), 1);
         assert!(direct_import_skip(&guard, 1).is_some());
     }
@@ -853,36 +857,66 @@ mod tests {
     fn ambiguous_filenames_are_rejected_when_a_map_is_forfeited() {
         let guard = forfeited_map_one();
         // No map name and no stats_demos entry: the digit alone can't be trusted.
-        assert!(resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_x.dem", 1, &[], &guard).is_err());
+        assert!(
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_x.dem", Some(1), &[], &guard)
+                .is_err()
+        );
         // Two recordings of the same file name.
         let twins = [recorded("de_nuke", "dup"), recorded("de_nuke", "dup")];
-        assert!(resolve_core_map_number("dup.dem", 1, &twins, &guard).is_err());
+        assert!(resolve_core_map_number("dup.dem", Some(1), &twins, &guard).is_err());
         // Same map played twice and no recording match.
         let repeated = guard_with_repeated_map();
-        assert!(resolve_core_map_number("s20-mid9001-0_de_nuke.dem", 1, &[], &repeated).is_err());
+        assert!(
+            resolve_core_map_number("s20-mid9001-0_de_nuke.dem", Some(1), &[], &repeated).is_err()
+        );
     }
 
     #[test]
-    fn a_stats_demos_position_that_contradicts_core_map_names_is_rejected() {
+    fn a_unique_core_map_name_beats_a_path_ordered_stats_demos_position() {
         // Core listed recordings in path order: map 2's file sits at index 0.
-        let forfeited = guard(&[named(1, "de_mirage", true), named(2, "de_nuke", false)]);
         let entries = [recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1")];
+        for forfeited in [true, false] {
+            let guard = guard(&[named(1, "de_mirage", forfeited), named(2, "de_nuke", false)]);
+            let resolved = resolve_core_map_number(
+                "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
+                Some(1),
+                &entries,
+                &guard,
+            );
+            assert_eq!(resolved.unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn a_repeated_map_name_never_trusts_a_stats_demos_position_beside_a_forfeit() {
+        // Maps 1 and 2 are both Nuke, map 1 forfeited; Core's path-order list
+        // puts the playable map 2 recording first, where it reads as map 1.
+        let entries = [recorded("de_nuke", "s20-mid9001-0_de_nuke-ts2")];
+        let forfeited = guard(&[named(1, "de_nuke", true), named(2, "de_nuke", false)]);
         let resolved = resolve_core_map_number(
-            "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
-            1,
+            "s20-mid9001-0_de_nuke-ts2.dem",
+            Some(1),
             &entries,
             &forfeited,
         );
         assert!(resolved.is_err(), "{resolved:?}");
-        // Without the skipped map, the conflict still rejects: the map is also the Stats id.
-        let unskipped = guard(&[named(1, "de_mirage", false), named(2, "de_nuke", false)]);
-        let resolved = resolve_core_map_number(
-            "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
-            1,
-            &entries,
-            &unskipped,
-        );
+        // Without a skipped map the position may break the tie, but only
+        // between the maps the filename names.
+        let played = guard(&[
+            named(1, "de_inferno", false),
+            named(2, "de_nuke", false),
+            named(3, "de_nuke", false),
+        ]);
+        let resolved =
+            resolve_core_map_number("s20-mid9001-0_de_nuke-ts2.dem", Some(1), &entries, &played);
         assert!(resolved.is_err(), "{resolved:?}");
+        let entries = [
+            recorded("de_inferno", "s20-mid9001-0_de_inferno-ts1"),
+            recorded("de_nuke", "s20-mid9001-0_de_nuke-ts2"),
+        ];
+        let resolved =
+            resolve_core_map_number("s20-mid9001-0_de_nuke-ts2.dem", Some(1), &entries, &played);
+        assert_eq!(resolved.unwrap(), 2);
     }
 
     #[test]
@@ -897,11 +931,13 @@ mod tests {
         ];
         let played = guard(&[named(1, "de_mirage", false), named(2, "de_nuke", false)]);
         assert_eq!(
-            resolve_core_map_number("auto0-unnamed.dem", 1, &entries, &played).unwrap(),
+            resolve_core_map_number("auto0-unnamed.dem", Some(1), &entries, &played).unwrap(),
             2
         );
         let forfeited = guard(&[named(1, "de_mirage", true), named(2, "de_nuke", false)]);
-        assert!(resolve_core_map_number("auto0-unnamed.dem", 1, &entries, &forfeited).is_err());
+        assert!(
+            resolve_core_map_number("auto0-unnamed.dem", Some(1), &entries, &forfeited).is_err()
+        );
     }
 
     fn guard_with_repeated_map() -> forfeit::MapGuard {
@@ -916,7 +952,7 @@ mod tests {
     fn unresolved_filenames_keep_the_digit_when_nothing_is_forfeited() {
         let guard = guard(&[named(1, "de_anubis", false), named(2, "de_nuke", false)]);
         assert_eq!(
-            resolve_core_map_number("s20-mid9001-1_unknown.dem", 2, &[], &guard).unwrap(),
+            resolve_core_map_number("s20-mid9001-1_unknown.dem", Some(2), &[], &guard).unwrap(),
             2
         );
     }
