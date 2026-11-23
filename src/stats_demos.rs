@@ -21,12 +21,18 @@ pub struct StatsDemo {
 /// One recorded map's archive, resolved to its Core map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapArtifact {
-    /// Stats id suffix (`{match}_{stats_index}`).
-    pub stats_index: usize,
-    /// Core's 1-based `map_number`, for the forfeit/void guard.
+    /// Core's 1-based `map_number`: the forfeit/void guard and the Stats id.
     pub core_map_number: i32,
     pub key: String,
     pub map_name: String,
+}
+
+impl MapArtifact {
+    /// Stats id suffix: Stats reads `{match}_{n}` as Core map `n + 1`
+    /// (CSC-Stats `manual-score.ts`), so it is never the key's list position.
+    pub fn stats_index(&self) -> i32 {
+        self.core_map_number - 1
+    }
 }
 
 /// `None` for NULL or an empty list (Core treats both as absent).
@@ -74,13 +80,94 @@ pub fn artifacts(entries: &[StatsDemo], guard: &MapGuard) -> Result<Vec<MapArtif
             );
         }
         resolved.push(MapArtifact {
-            stats_index: index,
             core_map_number,
             key: key.to_owned(),
             map_name: map_name.to_owned(),
         });
     }
     Ok(resolved)
+}
+
+/// A file name or path's basename, lowercased, without query/fragment or
+/// `.7z`/`.zip`/`.dem` suffixes.
+pub fn normalized_demo_basename(value: &str) -> String {
+    let value = value.rsplit('/').next().unwrap_or(value);
+    let mut normalized = value
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    loop {
+        let Some(stripped) = [".7z", ".zip", ".dem"]
+            .iter()
+            .find_map(|suffix| normalized.strip_suffix(suffix))
+        else {
+            return normalized;
+        };
+        normalized = stripped.to_owned();
+    }
+}
+
+/// Core's map for one BO3 recording. The `-N_` digit is unreliable (recordings
+/// can share `-0_`, Core-planning #242), and Core lists recordings in path order
+/// when it can't resolve the veto order, so a `stats_demos` position must agree
+/// with the Core map name in the filename. In order:
+/// - the `stats_demos` entry naming this file, if the filename names that
+///   position's Core map; a filename naming only other Core maps is a conflict;
+/// - the one Core map whose `map_name` the filename contains;
+/// - `fallback_map` (the entry's position, else the digit), only when no map of
+///   the match is skipped.
+///
+/// The result decides both the forfeit guard and the Stats id suffix, so
+/// anything else is rejected.
+pub fn resolve_core_map_number(
+    filename: &str,
+    digit_map: i32,
+    entries: &[StatsDemo],
+    guard: &MapGuard,
+) -> Result<i32> {
+    let name = normalized_demo_basename(filename);
+    let named = guard.map_numbers_named_in(filename);
+    let recorded: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            [&entry.demo_path, &entry.s3_key]
+                .into_iter()
+                .flatten()
+                .any(|path| normalized_demo_basename(path) == name)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let fallback_map = match recorded.as_slice() {
+        [index] => {
+            let map = i32::try_from(index + 1)?;
+            if named.contains(&map) {
+                return Ok(map);
+            }
+            if !named.is_empty() {
+                bail!(
+                    "{filename} is stats_demos[{index}] (Core map {map}) but names Core map(s) {named:?}"
+                );
+            }
+            map
+        }
+        [] => match named.as_slice() {
+            [number] => return Ok(*number),
+            _ => digit_map,
+        },
+        many => bail!(
+            "{filename} matches {} stats_demos entries ({many:?})",
+            many.len()
+        ),
+    };
+    if guard.has_skipped_maps() {
+        bail!(
+            "{filename} cannot be verified against one Core map (stats_demos/digit say map \
+             {fallback_map}; map names match {named:?}) and the match has forfeit/void maps"
+        );
+    }
+    Ok(fallback_map)
 }
 
 pub async fn fetch(pool: &PgPool, match_id: i64) -> Result<Option<Vec<StatsDemo>>> {
@@ -134,7 +221,7 @@ mod tests {
         let resolved = artifacts(&entries, &guard).unwrap();
         let positions: Vec<_> = resolved
             .iter()
-            .map(|artifact| (artifact.stats_index, artifact.core_map_number))
+            .map(|artifact| (artifact.stats_index(), artifact.core_map_number))
             .collect();
         assert_eq!(positions, vec![(1, 2), (2, 3)]);
     }

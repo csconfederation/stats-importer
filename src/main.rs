@@ -176,7 +176,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         let guard = forfeit::fetch_match_guard(pool, core_id).await?;
         if match_info.is_series {
             let entries = stats_demos::fetch(pool, core_id).await?;
-            core_map_number = resolve_core_map_number(
+            core_map_number = stats_demos::resolve_core_map_number(
                 filename,
                 core_map_number,
                 entries.as_deref().unwrap_or_default(),
@@ -316,51 +316,6 @@ fn core_map_number(filename: &str, is_series: bool) -> Result<i32> {
     Ok(num_char.to_string().parse::<i32>()? + 1)
 }
 
-/// Core's map for a BO3 file. The filename's `-N_` digit is unreliable (BO3
-/// recordings can share `-0_`, Core-planning #242), so Core's own per-map data
-/// decides: the `stats_demos` entry naming this file, else the one Core map
-/// whose `map_name` the filename contains. When neither identifies one map the
-/// digit is kept only if no map of the match is skipped, since a wrong map could
-/// then only matter to the forfeit guard; otherwise the file is rejected.
-fn resolve_core_map_number(
-    filename: &str,
-    digit_map: i32,
-    entries: &[stats_demos::StatsDemo],
-    guard: &forfeit::MapGuard,
-) -> Result<i32> {
-    let name = normalized_demo_basename(filename);
-    let recorded: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            [&entry.demo_path, &entry.s3_key]
-                .into_iter()
-                .flatten()
-                .filter_map(|path| path.rsplit('/').next())
-                .any(|base| normalized_demo_basename(base) == name)
-        })
-        .map(|(index, _)| index)
-        .collect();
-    match recorded.as_slice() {
-        [index] => return Ok(i32::try_from(index + 1)?),
-        [] => {}
-        many => {
-            return Err(anyhow!(
-                "{filename} matches {} stats_demos entries ({many:?})",
-                many.len()
-            ))
-        }
-    }
-    match guard.map_numbers_named_in(filename).as_slice() {
-        [number] => Ok(*number),
-        _ if !guard.has_skipped_maps() => Ok(digit_map),
-        candidates => Err(anyhow!(
-            "{filename} cannot be assigned to one Core map (its -N_ digit says map {digit_map}; \
-             map names match {candidates:?}) and the match has forfeit/void maps"
-        )),
-    }
-}
-
 /// Why a `--directory` file's map must not import played stats (map-scoped, so
 /// a BO3's other maps still import).
 fn direct_import_skip(
@@ -490,29 +445,10 @@ fn select_match_source(
 }
 
 fn demo_url_matches_filename(demo_url: Option<&str>, filename: &str) -> bool {
-    let filename = normalized_demo_basename(filename);
+    let filename = stats_demos::normalized_demo_basename(filename);
     demo_url
-        .and_then(|url| url.rsplit('/').next())
-        .map(normalized_demo_basename)
-        .map(|name| name == filename)
-        .unwrap_or(false)
-}
-
-fn normalized_demo_basename(value: &str) -> String {
-    let mut normalized = value
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(value)
-        .to_ascii_lowercase();
-    loop {
-        let Some(stripped) = [".7z", ".zip", ".dem"]
-            .iter()
-            .find_map(|suffix| normalized.strip_suffix(suffix))
-        else {
-            return normalized;
-        };
-        normalized = stripped.to_owned();
-    }
+        .map(stats_demos::normalized_demo_basename)
+        .is_some_and(|name| name == filename)
 }
 
 fn filename_indicates_combine(filename: &str) -> bool {
@@ -526,10 +462,12 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::stats_demos::resolve_core_map_number;
+
     use super::{
         core_map_number, demo_url_matches_filename, direct_import_skip, forfeit,
-        legacy_file_is_combine, match_info, resolve_core_map_number, select_match_source,
-        split_candidates, stats_demos, stats_match_type, Args, CoreMatch, MatchSource,
+        legacy_file_is_combine, match_info, select_match_source, split_candidates, stats_demos,
+        stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -883,7 +821,7 @@ mod tests {
                 s3_key: None,
             },
             recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1"),
-            recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts2"),
+            recorded("de_inferno", "s20-M01-A-vs-B-mid9001-0_de_inferno-ts2"),
         ];
         let guard = forfeited_map_one();
         let resolve = |name: &str| resolve_core_map_number(name, 1, &entries, &guard);
@@ -893,7 +831,7 @@ mod tests {
             2
         );
         assert_eq!(
-            resolve("s20-M01-A-vs-B-mid9001-0_de_nuke-ts2.dem.zip").unwrap(),
+            resolve("s20-M01-A-vs-B-mid9001-0_de_inferno-ts2.dem.zip").unwrap(),
             3
         );
         assert_eq!(direct_import_skip(&guard, 2), None);
@@ -922,6 +860,48 @@ mod tests {
         // Same map played twice and no recording match.
         let repeated = guard_with_repeated_map();
         assert!(resolve_core_map_number("s20-mid9001-0_de_nuke.dem", 1, &[], &repeated).is_err());
+    }
+
+    #[test]
+    fn a_stats_demos_position_that_contradicts_core_map_names_is_rejected() {
+        // Core listed recordings in path order: map 2's file sits at index 0.
+        let forfeited = guard(&[named(1, "de_mirage", true), named(2, "de_nuke", false)]);
+        let entries = [recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1")];
+        let resolved = resolve_core_map_number(
+            "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
+            1,
+            &entries,
+            &forfeited,
+        );
+        assert!(resolved.is_err(), "{resolved:?}");
+        // Without the skipped map, the conflict still rejects: the map is also the Stats id.
+        let unskipped = guard(&[named(1, "de_mirage", false), named(2, "de_nuke", false)]);
+        let resolved = resolve_core_map_number(
+            "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
+            1,
+            &entries,
+            &unskipped,
+        );
+        assert!(resolved.is_err(), "{resolved:?}");
+    }
+
+    #[test]
+    fn an_unnamed_stats_demos_file_is_trusted_only_without_skipped_maps() {
+        let entries = [
+            recorded("de_mirage", "a-de_mirage"),
+            stats_demos::StatsDemo {
+                map: None,
+                demo_path: Some("/demos/auto0-unnamed.dem".to_owned()),
+                s3_key: None,
+            },
+        ];
+        let played = guard(&[named(1, "de_mirage", false), named(2, "de_nuke", false)]);
+        assert_eq!(
+            resolve_core_map_number("auto0-unnamed.dem", 1, &entries, &played).unwrap(),
+            2
+        );
+        let forfeited = guard(&[named(1, "de_mirage", true), named(2, "de_nuke", false)]);
+        assert!(resolve_core_map_number("auto0-unnamed.dem", 1, &entries, &forfeited).is_err());
     }
 
     fn guard_with_repeated_map() -> forfeit::MapGuard {
