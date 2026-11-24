@@ -136,6 +136,9 @@ pub fn resolve_core_map_number(
     let unnamed_beside_skip = guard.has_skipped_maps() && guard.has_unnamed_real_map();
     if let [number] = named.as_slice() {
         if !unnamed_beside_skip {
+            if !guard.is_real_map(*number) {
+                bail!("{filename} resolves to Core map {number}, which is not a real Core map");
+            }
             return Ok(*number);
         }
     }
@@ -272,6 +275,27 @@ mod tests {
         assert_eq!(
             resolve_core_map_number(filename, Some(3), &[], &guard).unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn a_named_unplayed_sweep_placeholder_fails_closed() {
+        let mut placeholder = played(9001, 3, 0, 0);
+        placeholder.has_winner = false;
+        placeholder.map_name = Some("de_inferno".to_owned());
+        let guard = MapGuard::from_rows(&[
+            named(9001, 1, "de_nuke"),
+            named(9001, 2, "de_mirage"),
+            placeholder,
+        ]);
+        // Even a unique filename map-name match must not resolve to an unplayed map-3 placeholder.
+        assert!(
+            resolve_core_map_number("s20-mid9001-2_de_inferno.dem", Some(3), &[], &guard).is_err()
+        );
+        assert!(resolve_core_map_number("de_inferno.dem", None, &[], &guard).is_err());
+        assert_eq!(
+            resolve_core_map_number("de_mirage.dem", None, &[], &guard).unwrap(),
+            2
         );
     }
 
