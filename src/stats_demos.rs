@@ -65,6 +65,11 @@ pub fn artifacts(entries: &[StatsDemo], guard: &MapGuard) -> Result<Vec<MapArtif
             continue;
         };
         let core_map_number = i32::try_from(index + 1)?;
+        if !guard.is_real_map(core_map_number) {
+            bail!(
+                "stats_demos[{index}] ({key}): Core has no played/forfeited map {core_map_number}"
+            );
+        }
         let map_name = guard
             .map_name(core_map_number)
             .or(entry.map.as_deref().filter(|name| !name.is_empty()))
@@ -270,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_for_the_wrong_map_fails_closed() {
+    fn a_key_for_the_wrong_or_missing_map_fails_closed() {
         let entries = parse(Some(&json!([
             {"map": "de_nuke", "demo_path": "/d/a.dem", "s3_key": "s20/a_de_nuke.dem.zip"},
         ])))
@@ -278,6 +283,9 @@ mod tests {
         .unwrap();
         let guard = MapGuard::from_rows(&[named(9001, 1, "de_anubis")]);
         assert!(artifacts(&entries, &guard).is_err());
-        assert!(artifacts(&entries, &MapGuard::default()).is_ok());
+        // Core has no real map 1: an extra stats_demos entry cannot invent an out-of-range key.
+        assert!(artifacts(&entries, &MapGuard::default()).is_err());
+        let ok_guard = MapGuard::from_rows(&[named(9001, 1, "de_nuke")]);
+        assert!(artifacts(&entries, &ok_guard).is_ok());
     }
 }

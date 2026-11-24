@@ -1296,10 +1296,9 @@ fn discover_demos(
         // Archive position is needed only for an unnamed demo that Core's map
         // names and stats_demos can't place (a suffixed one falls back to its
         // digit); then the bundle must be whole and all unnamed.
-        let needs_position = unnamed.iter().any(|filename| {
-            stats_demos::resolve_core_map_number(filename, None, &entries, &core_match.map_guard)
-                .is_err()
-        });
+        let needs_position = unnamed
+            .iter()
+            .any(|filename| resolve_bundled_map(filename, None, &entries, core_match).is_err());
         if needs_position {
             if !suffixed.is_empty() {
                 bail!("BO3 archive mixes suffixed and unnamed demos; map attribution is ambiguous");
@@ -1359,7 +1358,13 @@ fn discover_demos(
             // in this season. The `-N_` digit (Stats' zero-based index) can
             // repeat across maps, so Core's per-map data resolves the map
             // before the guard runs; the Stats id follows the resolved map.
-            let digit_map = map_suffix.parse::<i32>()? + 1;
+            let digit_map = map_suffix
+                .parse::<i32>()
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| {
+                    anyhow!("ambiguous_map: invalid map suffix {map_suffix:?} in {filename}")
+                })?;
             let map = resolve_bundled_map(filename, Some(digit_map), &entries, core_match)?;
             core_map_number = Some(map);
             (
@@ -1418,8 +1423,16 @@ fn resolve_bundled_map(
     entries: &[stats_demos::StatsDemo],
     core_match: &CoreMatch,
 ) -> Result<i32> {
-    stats_demos::resolve_core_map_number(filename, fallback, entries, &core_match.map_guard)
-        .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))
+    let map =
+        stats_demos::resolve_core_map_number(filename, fallback, entries, &core_match.map_guard)
+            .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))?;
+    if !core_match.map_guard.is_real_map(map) {
+        bail!(
+            "ambiguous_map: Core match {}: {filename} resolves to unplayed placeholder map {map}",
+            core_match.match_id
+        );
+    }
+    Ok(map)
 }
 
 /// Discovers the single demo inside one `s3_keys`-derived per-map archive.
@@ -4385,6 +4398,30 @@ mod tests {
         let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
         assert!(
             format!("{error:#}").contains("Core map 5, which Core has no row for"),
+            "{error:#}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_sweep_placeholder_map_fails_closed_in_a_mixed_bundle() {
+        let root = test_path("sweep-placeholder-mixed");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("de_nuke.dem"), b"a").unwrap();
+        fs::write(root.join("s20-mid9001-2_unknown.dem"), b"b").unwrap();
+        let mut core = guarded(
+            9001,
+            &[
+                named_map(9001, 1, 13, 5, "de_nuke"),
+                named_map(9001, 2, 13, 7, "de_mirage"),
+                unplayed(9001, 3),
+            ],
+        );
+        core.played_map_numbers = vec![1, 2];
+        core.map_count = 2;
+        let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unplayed placeholder map 3"),
             "{error:#}"
         );
         fs::remove_dir_all(root).unwrap();

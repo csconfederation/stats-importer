@@ -311,12 +311,19 @@ fn core_map_number(filename: &str, is_series: bool) -> Result<i32> {
     if !is_series {
         return Ok(1);
     }
-    let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
+    let map_number_re = Regex::new(r"-mid[0-9]*-([0-9]+)(?:[^0-9]|$)").expect("regex is busted");
     let captures = map_number_re
         .captures(filename)
         .ok_or_else(|| anyhow!("cannot parse series map number from filename, skipping..."))?;
-    let num_char = captures.get(0).unwrap().as_str().chars().last().unwrap();
-    Ok(num_char.to_string().parse::<i32>()? + 1)
+    let index = captures
+        .get(1)
+        .unwrap()
+        .as_str()
+        .parse::<i32>()
+        .map_err(|_| anyhow!("series map number overflows i32"))?;
+    index
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("series map number overflows i32"))
 }
 
 /// Why a `--directory` file's map must not import played stats (map-scoped, so
@@ -1013,5 +1020,18 @@ mod tests {
         let error = directory_rekey_check(9001, &canonical, &unnamed, 3).unwrap_err();
         assert!(error.to_string().contains("9001_2"), "{error}");
         directory_rekey_check(9001, &canonical[..1], &unnamed, 3).unwrap();
+    }
+
+    #[test]
+    fn core_map_number_parses_multi_digit_suffix_and_checks_overflow() {
+        assert_eq!(
+            core_map_number("s20-mid9001-0_de_nuke.dem", true).unwrap(),
+            1
+        );
+        assert_eq!(
+            core_map_number("s20-mid9001-10_unknown.dem", true).unwrap(),
+            11
+        );
+        assert!(core_map_number("s20-mid9001-99999999999_unknown.dem", true).is_err());
     }
 }
