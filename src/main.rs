@@ -11,6 +11,9 @@ use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 mod backfill;
+mod forfeit;
+mod stats_demos;
+mod stats_ids;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -151,6 +154,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 season: i32::from(season),
                 match_day,
                 is_series: false,
+                core_regulation_id: None,
                 match_date: None,
                 match_type: if is_combine {
                     "Combine".to_owned()
@@ -168,22 +172,34 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Err(_) => file_path,
     };
 
+    let client = reqwest::Client::new();
+    let stats_url = env::var("STATS_API_URL").expect("STATS_API_URL expected");
+    let mut core_map_number = core_map_number(filename, match_info.is_series)?;
+    if let Some(core_id) = match_info.core_regulation_id {
+        let guard = forfeit::fetch_match_guard(pool, core_id).await?;
+        if match_info.is_series {
+            let entries = stats_demos::fetch(pool, core_id).await?;
+            core_map_number = stats_demos::resolve_core_map_number(
+                filename,
+                Some(core_map_number),
+                entries.as_deref().unwrap_or_default(),
+                &guard,
+            )
+            .map_err(|error| anyhow!("ambiguous_map: Core match {core_id}: {error}"))?;
+        }
+        if let Some(reason) = direct_import_skip(&guard, core_map_number) {
+            return Err(anyhow!(
+                "skipped_forfeit: Core match {core_id} map {core_map_number}: {}",
+                reason.describe()
+            ));
+        }
+        if match_info.is_series {
+            let existing = stats_ids::fetch(&client, &stats_url, core_id).await?;
+            directory_rekey_check(core_id, &existing, &guard, core_map_number)?;
+        }
+    }
     let map_num_str = if match_info.is_series {
-        let map_number_re = Regex::new(r"-mid([0-9]*)-[0-9]").expect("regex is busted");
-        let map_number = match map_number_re.captures(filename) {
-            Some(captures) => {
-                let c = captures.get(0).unwrap().as_str();
-                let num_char = c.chars().last().unwrap();
-                let map_num = num_char.to_string().parse::<i32>()?;
-                map_num
-            }
-            None => {
-                return Err(anyhow!(
-                    "cannot parse series map number from filename, skipping..."
-                ));
-            }
-        };
-        format!("_{}", map_number)
+        format!("_{}", core_map_number - 1)
     } else {
         String::new()
     };
@@ -198,11 +214,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         fix_core_scores: args.fix_core_scores.unwrap_or(false),
         fix_team_names: args.fix_team_names.unwrap_or(false),
     };
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/add-match",
-        env::var("STATS_API_URL").expect("STATS_API_URL expected")
-    );
+    let url = format!("{stats_url}/api/add-match");
     let resp = client.post(url).json(&body).send().await?;
     if resp.status() != 200 {
         return Err(anyhow!("{}", resp.status()));
@@ -234,6 +246,8 @@ struct MatchInfo {
     tier: Option<String>,
     match_day: String,
     is_series: bool,
+    // Core id of a regulation match; the forfeit/void guard only applies to these.
+    core_regulation_id: Option<i64>,
     match_date: Option<String>,
     match_type: String,
 }
@@ -289,6 +303,54 @@ async fn get_core_match(id: i64, pool: &PgPool, filename: &str, args: &Args) -> 
         MatchSource::Combine => combine.expect("selected combine match must exist"),
     };
     match_info(selected)
+}
+
+/// Core's 1-based `map_number` for a file. A series filename carries Stats'
+/// zero-based map index (`-mid9001-1_…` is map 2); a BO1 is always map 1.
+fn core_map_number(filename: &str, is_series: bool) -> Result<i32> {
+    if !is_series {
+        return Ok(1);
+    }
+    let map_number_re = Regex::new(r"-mid[0-9]*-([0-9]+)(?:[^0-9]|$)").expect("regex is busted");
+    let captures = map_number_re
+        .captures(filename)
+        .ok_or_else(|| anyhow!("cannot parse series map number from filename, skipping..."))?;
+    let index = captures
+        .get(1)
+        .unwrap()
+        .as_str()
+        .parse::<i32>()
+        .map_err(|_| anyhow!("series map number overflows i32"))?;
+    index
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("series map number overflows i32"))
+}
+
+/// Why a `--directory` file's map must not import played stats (map-scoped, so
+/// a BO3's other maps still import).
+fn direct_import_skip(
+    guard: &forfeit::MapGuard,
+    core_map_number: i32,
+) -> Option<forfeit::SkipReason> {
+    guard.skip_reason(core_map_number)
+}
+
+/// A series file writes `{id}_{map - 1}`; a legacy positional id for another
+/// map would survive beside it as a duplicate, or be overwritten at that key.
+fn directory_rekey_check(
+    core_id: i64,
+    existing: &[stats_ids::StatsMatch],
+    guard: &forfeit::MapGuard,
+    core_map_number: i32,
+) -> Result<()> {
+    let stale = stats_ids::stale(core_id, existing, guard, Some(core_map_number));
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "legacy_rekey_required: Core match {core_id}: Stats holds {stale:?} that don't match \
+         Core's maps; rekey them before importing map {core_map_number}"
+    ))
 }
 
 fn is_combine_type(match_type: &str) -> bool {
@@ -351,6 +413,7 @@ fn match_info(row: &CoreMatch) -> Result<MatchInfo> {
         tier,
         match_day,
         is_series: row.is_bo3,
+        core_regulation_id: (!is_combine_type(&row.match_type)).then_some(row.id),
         match_date: row.match_date.clone(),
         match_type: match_type.to_owned(),
     })
@@ -410,29 +473,10 @@ fn select_match_source(
 }
 
 fn demo_url_matches_filename(demo_url: Option<&str>, filename: &str) -> bool {
-    let filename = normalized_demo_basename(filename);
+    let filename = stats_demos::normalized_demo_basename(filename);
     demo_url
-        .and_then(|url| url.rsplit('/').next())
-        .map(normalized_demo_basename)
-        .map(|name| name == filename)
-        .unwrap_or(false)
-}
-
-fn normalized_demo_basename(value: &str) -> String {
-    let mut normalized = value
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(value)
-        .to_ascii_lowercase();
-    loop {
-        let Some(stripped) = [".7z", ".zip", ".dem"]
-            .iter()
-            .find_map(|suffix| normalized.strip_suffix(suffix))
-        else {
-            return normalized;
-        };
-        normalized = stripped.to_owned();
-    }
+        .map(stats_demos::normalized_demo_basename)
+        .is_some_and(|name| name == filename)
 }
 
 fn filename_indicates_combine(filename: &str) -> bool {
@@ -446,9 +490,12 @@ fn legacy_file_is_combine(args: &Args, filename: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::stats_demos::resolve_core_map_number;
+
     use super::{
-        demo_url_matches_filename, legacy_file_is_combine, match_info, select_match_source,
-        split_candidates, stats_match_type, Args, CoreMatch, MatchSource,
+        core_map_number, demo_url_matches_filename, direct_import_skip, directory_rekey_check,
+        forfeit, legacy_file_is_combine, match_info, select_match_source, split_candidates,
+        stats_demos, stats_ids, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -695,5 +742,314 @@ mod tests {
         let mut scrim = league(None);
         scrim.match_type = "SCRIM".to_owned();
         assert!(match_info(&scrim).is_err());
+    }
+
+    fn guard(rows: &[forfeit::MapRow]) -> forfeit::MapGuard {
+        forfeit::MapGuard::from_rows(rows)
+    }
+
+    #[test]
+    fn directory_import_allows_adjusted_zero_thirteen_and_bo3_thirteen_zero() {
+        let adjusted = guard(&[forfeit::test_rows::played(6034, 1, 0, 13)]);
+        assert_eq!(direct_import_skip(&adjusted, 1), None);
+        let bo3 = guard(&[
+            forfeit::test_rows::played(9001, 1, 13, 0),
+            forfeit::test_rows::played(9001, 2, 7, 13),
+        ]);
+        assert_eq!(direct_import_skip(&bo3, 1), None);
+        assert_eq!(direct_import_skip(&bo3, 2), None);
+    }
+
+    #[test]
+    fn directory_import_skips_only_the_forfeited_map() {
+        let mut forfeited = forfeit::test_rows::played(9001, 1, 0, 13);
+        forfeited.is_forfeit = true;
+        let bo3 = guard(&[forfeited, forfeit::test_rows::played(9001, 2, 13, 5)]);
+        assert!(direct_import_skip(&bo3, 1).is_some());
+        assert_eq!(direct_import_skip(&bo3, 2), None);
+        let legacy = guard(&[forfeit::test_rows::played(9003, 1, 0, 1)]);
+        assert_eq!(
+            direct_import_skip(&legacy, 1),
+            Some(forfeit::SkipReason::LegacyOneZero)
+        );
+    }
+
+    #[test]
+    fn directory_import_maps_filename_index_to_core_map_number() {
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-0_de_x.dem", true).unwrap(),
+            1
+        );
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-1_de_x.dem", true).unwrap(),
+            2
+        );
+        assert_eq!(
+            core_map_number("s20-M01-A-vs-B-mid9001-0_de_x.dem", false).unwrap(),
+            1
+        );
+        assert!(core_map_number("s20-M01-A-vs-B-mid9001.dem", true).is_err());
+
+        // BO3 with map 2 forfeited: the `-1_` file is skipped, the `-0_` file isn't.
+        let mut forfeited = forfeit::test_rows::played(9001, 2, 0, 13);
+        forfeited.is_forfeit = true;
+        let bo3 = guard(&[forfeit::test_rows::played(9001, 1, 13, 6), forfeited]);
+        let skip = |name: &str| direct_import_skip(&bo3, core_map_number(name, true).unwrap());
+        assert_eq!(skip("s20-M01-A-vs-B-mid9001-0_de_x.dem"), None);
+        assert!(skip("s20-M01-A-vs-B-mid9001-1_de_x.dem").is_some());
+    }
+
+    #[test]
+    fn directory_import_does_not_skip_a_reversed_forfeit() {
+        // Reversed by the tool: newest audit row is not a forfeit.
+        let mut by_tool = forfeit::test_rows::played(9001, 1, 0, 0);
+        by_tool.has_audit = true;
+        assert_eq!(direct_import_skip(&guard(&[by_tool]), 1), None);
+        // Cleared by hand and replayed: audited, so the flag decides, whatever
+        // the score (a replay may finish 13-0 or 0-1 again).
+        for (home, away) in [(7, 13), (13, 0), (0, 1)] {
+            let mut by_hand = forfeit::test_rows::played(9001, 1, home, away);
+            by_hand.has_audit = true;
+            assert_eq!(direct_import_skip(&guard(&[by_hand]), 1), None);
+        }
+    }
+
+    fn named(map: i32, name: &str, forfeited: bool) -> forfeit::MapRow {
+        forfeit::MapRow {
+            map_name: Some(name.to_owned()),
+            is_forfeit: forfeited,
+            ..forfeit::test_rows::played(9001, map, 13, 5)
+        }
+    }
+
+    fn recorded(map: &str, file: &str) -> stats_demos::StatsDemo {
+        stats_demos::StatsDemo {
+            map: Some(map.to_owned()),
+            demo_path: Some(format!("/demos/{file}.dem")),
+            s3_key: Some(format!("s20/M1/{file}.dem.zip")),
+        }
+    }
+
+    // BO3 whose map 1 (anubis) was forfeited and whose played map 2 (nuke)
+    // was recorded with the same `-0_` digit as everything else (#242).
+    fn forfeited_map_one() -> forfeit::MapGuard {
+        guard(&[
+            named(1, "de_anubis", true),
+            named(2, "de_nuke", false),
+            named(3, "de_inferno", false),
+        ])
+    }
+
+    #[test]
+    fn duplicate_zero_digit_filenames_resolve_through_stats_demos() {
+        let entries = [
+            stats_demos::StatsDemo {
+                map: None,
+                demo_path: None,
+                s3_key: None,
+            },
+            recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1"),
+            recorded("de_inferno", "s20-M01-A-vs-B-mid9001-0_de_inferno-ts2"),
+        ];
+        let guard = forfeited_map_one();
+        let resolve = |name: &str| resolve_core_map_number(name, Some(1), &entries, &guard);
+        // The digit says map 1 (forfeited); stats_demos says maps 2 and 3.
+        assert_eq!(
+            resolve("s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem").unwrap(),
+            2
+        );
+        assert_eq!(
+            resolve("s20-M01-A-vs-B-mid9001-0_de_inferno-ts2.dem.zip").unwrap(),
+            3
+        );
+        assert_eq!(direct_import_skip(&guard, 2), None);
+    }
+
+    #[test]
+    fn duplicate_zero_digit_filenames_resolve_through_core_map_names() {
+        let guard = forfeited_map_one();
+        let resolved =
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_de_nuke.dem", Some(1), &[], &guard);
+        assert_eq!(resolved.unwrap(), 2);
+        let resolved = resolve_core_map_number(
+            "s20-M01-A-vs-B-mid9001-0_de_anubis.dem",
+            Some(1),
+            &[],
+            &guard,
+        );
+        assert_eq!(resolved.unwrap(), 1);
+        assert!(direct_import_skip(&guard, 1).is_some());
+    }
+
+    #[test]
+    fn ambiguous_filenames_are_rejected_when_a_map_is_forfeited() {
+        let guard = forfeited_map_one();
+        // No map name and no stats_demos entry: the digit alone can't be trusted.
+        assert!(
+            resolve_core_map_number("s20-M01-A-vs-B-mid9001-0_x.dem", Some(1), &[], &guard)
+                .is_err()
+        );
+        // Two recordings of the same file name.
+        let twins = [recorded("de_nuke", "dup"), recorded("de_nuke", "dup")];
+        assert!(resolve_core_map_number("dup.dem", Some(1), &twins, &guard).is_err());
+        // Same map played twice and no recording match.
+        let repeated = guard_with_repeated_map();
+        assert!(
+            resolve_core_map_number("s20-mid9001-0_de_nuke.dem", Some(1), &[], &repeated).is_err()
+        );
+    }
+
+    #[test]
+    fn a_unique_core_map_name_beats_a_path_ordered_stats_demos_position() {
+        // Core listed recordings in path order: map 2's file sits at index 0.
+        let entries = [recorded("de_nuke", "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1")];
+        for forfeited in [true, false] {
+            let guard = guard(&[named(1, "de_mirage", forfeited), named(2, "de_nuke", false)]);
+            let resolved = resolve_core_map_number(
+                "s20-M01-A-vs-B-mid9001-0_de_nuke-ts1.dem",
+                Some(1),
+                &entries,
+                &guard,
+            );
+            assert_eq!(resolved.unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn a_repeated_map_name_never_trusts_a_stats_demos_position_beside_a_forfeit() {
+        // Maps 1 and 2 are both Nuke, map 1 forfeited; Core's path-order list
+        // puts the playable map 2 recording first, where it reads as map 1.
+        let entries = [recorded("de_nuke", "s20-mid9001-0_de_nuke-ts2")];
+        let forfeited = guard(&[named(1, "de_nuke", true), named(2, "de_nuke", false)]);
+        let resolved = resolve_core_map_number(
+            "s20-mid9001-0_de_nuke-ts2.dem",
+            Some(1),
+            &entries,
+            &forfeited,
+        );
+        assert!(resolved.is_err(), "{resolved:?}");
+        // Without a skipped map the position may break the tie, but only
+        // between the maps the filename names.
+        let played = guard(&[
+            named(1, "de_inferno", false),
+            named(2, "de_nuke", false),
+            named(3, "de_nuke", false),
+        ]);
+        let resolved =
+            resolve_core_map_number("s20-mid9001-0_de_nuke-ts2.dem", Some(1), &entries, &played);
+        assert!(resolved.is_err(), "{resolved:?}");
+        let entries = [
+            recorded("de_inferno", "s20-mid9001-0_de_inferno-ts1"),
+            recorded("de_nuke", "s20-mid9001-0_de_nuke-ts2"),
+        ];
+        let resolved =
+            resolve_core_map_number("s20-mid9001-0_de_nuke-ts2.dem", Some(1), &entries, &played);
+        assert_eq!(resolved.unwrap(), 2);
+    }
+
+    #[test]
+    fn an_unnamed_stats_demos_file_is_trusted_only_without_skipped_maps() {
+        let entries = [
+            recorded("de_mirage", "a-de_mirage"),
+            stats_demos::StatsDemo {
+                map: None,
+                demo_path: Some("/demos/auto0-unnamed.dem".to_owned()),
+                s3_key: None,
+            },
+        ];
+        let played = guard(&[named(1, "de_mirage", false), named(2, "de_nuke", false)]);
+        assert_eq!(
+            resolve_core_map_number("auto0-unnamed.dem", Some(1), &entries, &played).unwrap(),
+            2
+        );
+        let forfeited = guard(&[named(1, "de_mirage", true), named(2, "de_nuke", false)]);
+        assert!(
+            resolve_core_map_number("auto0-unnamed.dem", Some(1), &entries, &forfeited).is_err()
+        );
+    }
+
+    fn guard_with_repeated_map() -> forfeit::MapGuard {
+        guard(&[
+            named(1, "de_anubis", true),
+            named(2, "de_nuke", false),
+            named(3, "de_nuke", false),
+        ])
+    }
+
+    #[test]
+    fn unresolved_filenames_keep_the_digit_when_nothing_is_forfeited() {
+        let guard = guard(&[named(1, "de_anubis", false), named(2, "de_nuke", false)]);
+        assert_eq!(
+            resolve_core_map_number("s20-mid9001-1_unknown.dem", Some(2), &[], &guard).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn directory_import_skips_reviewed_void_maps() {
+        let void = guard(&[forfeit::test_rows::played(7339, 1, 0, 0)]);
+        assert_eq!(
+            direct_import_skip(&void, 1),
+            Some(forfeit::SkipReason::ReviewedVoid)
+        );
+    }
+
+    #[test]
+    fn directory_import_blocks_a_legacy_positional_id_beside_its_canonical_target() {
+        // Maps 1, 3 were stored positionally as `_0`, `_1`; map 3 now writes `_2`.
+        let gap = guard(&[named(1, "de_dust2", false), named(3, "de_mirage", false)]);
+        let row = |id: &str, map: &str| stats_ids::StatsMatch {
+            match_id: id.to_owned(),
+            map_name: map.to_owned(),
+        };
+        let legacy = [row("9001_0", "de_dust2"), row("9001_1", "de_mirage")];
+        let error = directory_rekey_check(9001, &legacy, &gap, 3).unwrap_err();
+        assert!(
+            error.to_string().starts_with("legacy_rekey_required")
+                && error.to_string().contains("9001_1"),
+            "{error}"
+        );
+        let canonical = [row("9001_0", "de_dust2"), row("9001_2", "de_mirage")];
+        directory_rekey_check(9001, &canonical, &gap, 3).unwrap();
+        directory_rekey_check(9001, &[], &gap, 3).unwrap();
+        // Without Core's map_name, nothing proves `_2` already holds map 3.
+        let unnamed = guard(&[
+            forfeit::test_rows::played(9001, 1, 13, 5),
+            forfeit::test_rows::played(9001, 3, 13, 7),
+        ]);
+        let error = directory_rekey_check(9001, &canonical, &unnamed, 3).unwrap_err();
+        assert!(error.to_string().contains("9001_2"), "{error}");
+        directory_rekey_check(9001, &canonical[..1], &unnamed, 3).unwrap();
+    }
+
+    #[test]
+    fn core_map_number_parses_multi_digit_suffix_and_checks_overflow() {
+        assert_eq!(
+            core_map_number("s20-mid9001-0_de_nuke.dem", true).unwrap(),
+            1
+        );
+        assert_eq!(
+            core_map_number("s20-mid9001-10_unknown.dem", true).unwrap(),
+            11
+        );
+        assert!(core_map_number("s20-mid9001-99999999999_unknown.dem", true).is_err());
+    }
+
+    #[test]
+    fn directory_rejects_unplayed_sweep_placeholder_map() {
+        let placeholder = forfeit::MapRow {
+            has_winner: false,
+            ..forfeit::test_rows::played(9001, 3, 0, 0)
+        };
+        let sweep = guard(&[
+            named(1, "de_nuke", false),
+            named(2, "de_mirage", false),
+            placeholder,
+        ]);
+        let fallback = core_map_number("s20-mid9001-2_unknown.dem", true).unwrap();
+        assert!(
+            resolve_core_map_number("s20-mid9001-2_unknown.dem", Some(fallback), &[], &sweep)
+                .is_err()
+        );
     }
 }
