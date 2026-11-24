@@ -168,9 +168,10 @@ pub fn resolve_core_map_number(
     if !named.is_empty() && !named.contains(&map) {
         bail!("{filename} resolves to Core map {map} but names Core maps {named:?}");
     }
-    // A fallback digit or stats_demos index can run past Core's maps.
-    if !guard.has_map(map) {
-        bail!("{filename} resolves to Core map {map}, which Core has no row for");
+    // A fallback digit or stats_demos index can run past Core's played maps
+    // (or point at a 2-0 sweep's unplayed map-3 placeholder).
+    if !guard.is_real_map(map) {
+        bail!("{filename} resolves to Core map {map}, which is not a real Core map");
     }
     Ok(map)
 }

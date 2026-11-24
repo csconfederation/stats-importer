@@ -1423,16 +1423,8 @@ fn resolve_bundled_map(
     entries: &[stats_demos::StatsDemo],
     core_match: &CoreMatch,
 ) -> Result<i32> {
-    let map =
-        stats_demos::resolve_core_map_number(filename, fallback, entries, &core_match.map_guard)
-            .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))?;
-    if !core_match.map_guard.is_real_map(map) {
-        bail!(
-            "ambiguous_map: Core match {}: {filename} resolves to unplayed placeholder map {map}",
-            core_match.match_id
-        );
-    }
-    Ok(map)
+    stats_demos::resolve_core_map_number(filename, fallback, entries, &core_match.map_guard)
+        .with_context(|| format!("ambiguous_map: Core match {}", core_match.match_id))
 }
 
 /// Discovers the single demo inside one `s3_keys`-derived per-map archive.
@@ -4397,7 +4389,7 @@ mod tests {
         core.map_count = 3;
         let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
         assert!(
-            format!("{error:#}").contains("Core map 5, which Core has no row for"),
+            format!("{error:#}").contains("Core map 5, which is not a real Core map"),
             "{error:#}"
         );
         fs::remove_dir_all(root).unwrap();
@@ -4421,7 +4413,7 @@ mod tests {
         core.map_count = 2;
         let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
         assert!(
-            format!("{error:#}").contains("unplayed placeholder map 3"),
+            format!("{error:#}").contains("Core map 3, which is not a real Core map"),
             "{error:#}"
         );
         fs::remove_dir_all(root).unwrap();

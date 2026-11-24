@@ -1034,4 +1034,22 @@ mod tests {
         );
         assert!(core_map_number("s20-mid9001-99999999999_unknown.dem", true).is_err());
     }
+
+    #[test]
+    fn directory_rejects_unplayed_sweep_placeholder_map() {
+        let placeholder = forfeit::MapRow {
+            has_winner: false,
+            ..forfeit::test_rows::played(9001, 3, 0, 0)
+        };
+        let sweep = guard(&[
+            named(1, "de_nuke", false),
+            named(2, "de_mirage", false),
+            placeholder,
+        ]);
+        let fallback = core_map_number("s20-mid9001-2_unknown.dem", true).unwrap();
+        assert!(
+            resolve_core_map_number("s20-mid9001-2_unknown.dem", Some(fallback), &[], &sweep)
+                .is_err()
+        );
+    }
 }

@@ -155,11 +155,6 @@ impl MapGuard {
             .collect()
     }
 
-    /// Core has a row for this map (placeholders included).
-    pub fn has_map(&self, map_number: i32) -> bool {
-        self.map_numbers.contains(&map_number)
-    }
-
     /// A Core map, not a trailing placeholder. BO3 maps are played in order, so
     /// a 0-0 map before a played one is a reversed forfeit, not a placeholder.
     pub fn is_real_map(&self, map_number: i32) -> bool {
