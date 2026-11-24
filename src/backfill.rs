@@ -1994,7 +1994,7 @@ async fn process_match(
     season_match_ids: &HashSet<i64>,
     reviewed_inventory: Option<&ReviewedInventory>,
     cached_source_inventory: Option<&CachedSourceInventory>,
-    existing_stats_ids: &[String],
+    existing_stats_ids: &[stats_ids::StatsMatch],
 ) -> Result<()> {
     // A BO3 decides this after its demos are resolved to maps (below): a map
     // reversed through Core's mutation reads as unplayed until its demo is found.
@@ -2026,7 +2026,10 @@ async fn process_match(
                 )),
                 Some(json!({
                     "staleStatsIds": stale,
-                    "existingStatsIds": existing_stats_ids,
+                    "existingStatsIds": existing_stats_ids
+                        .iter()
+                        .map(|row| json!({ "matchId": row.match_id, "mapName": row.map_name }))
+                        .collect::<Vec<_>>(),
                     "coreMapNumbers": core_match.played_map_numbers,
                 })),
             ));
@@ -4367,7 +4370,7 @@ mod tests {
         args: &BackfillArgs,
         core: &CoreMatch,
         reviewed: Option<&ReviewedInventory>,
-        existing_stats_ids: &[String],
+        existing_stats_ids: &[stats_ids::StatsMatch],
     ) -> (Result<()>, Vec<LedgerEvent>) {
         let path = args.workspace.join("out.jsonl");
         let _ = fs::remove_file(&path);
@@ -4392,8 +4395,14 @@ mod tests {
         (result, events)
     }
 
-    fn stats_ids(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
+    fn stats_ids(values: &[&str]) -> Vec<stats_ids::StatsMatch> {
+        values
+            .iter()
+            .map(|value| stats_ids::StatsMatch {
+                match_id: (*value).to_owned(),
+                map_name: "de_x".to_owned(),
+            })
+            .collect()
     }
 
     fn unplayed(match_id: i64, map: i32) -> forfeit::MapRow {

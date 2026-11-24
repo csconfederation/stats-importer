@@ -332,7 +332,7 @@ fn direct_import_skip(
 /// map would survive beside it as a duplicate.
 fn directory_rekey_check(
     core_id: i64,
-    existing: &[String],
+    existing: &[stats_ids::StatsMatch],
     guard: &forfeit::MapGuard,
     core_map_number: i32,
 ) -> Result<()> {
@@ -488,7 +488,7 @@ mod tests {
     use super::{
         core_map_number, demo_url_matches_filename, direct_import_skip, directory_rekey_check,
         forfeit, legacy_file_is_combine, match_info, select_match_source, split_candidates,
-        stats_demos, stats_match_type, Args, CoreMatch, MatchSource,
+        stats_demos, stats_ids, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -994,14 +994,18 @@ mod tests {
             forfeit::test_rows::played(9001, 1, 13, 5),
             forfeit::test_rows::played(9001, 3, 13, 7),
         ]);
-        let legacy = ["9001_0".to_owned(), "9001_1".to_owned()];
+        let row = |id: &str| stats_ids::StatsMatch {
+            match_id: id.to_owned(),
+            map_name: "de_x".to_owned(),
+        };
+        let legacy = [row("9001_0"), row("9001_1")];
         let error = directory_rekey_check(9001, &legacy, &gap, 3).unwrap_err();
         assert!(
             error.to_string().starts_with("legacy_rekey_required")
                 && error.to_string().contains("9001_1"),
             "{error}"
         );
-        let canonical = ["9001_0".to_owned(), "9001_2".to_owned()];
+        let canonical = [row("9001_0"), row("9001_2")];
         directory_rekey_check(9001, &canonical, &gap, 3).unwrap();
         directory_rekey_check(9001, &[], &gap, 3).unwrap();
     }
