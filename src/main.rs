@@ -329,7 +329,7 @@ fn direct_import_skip(
 }
 
 /// A series file writes `{id}_{map - 1}`; a legacy positional id for another
-/// map would survive beside it as a duplicate.
+/// map would survive beside it as a duplicate, or be overwritten at that key.
 fn directory_rekey_check(
     core_id: i64,
     existing: &[stats_ids::StatsMatch],
@@ -341,8 +341,8 @@ fn directory_rekey_check(
         return Ok(());
     }
     Err(anyhow!(
-        "legacy_rekey_required: Core match {core_id}: Stats holds {stale:?} outside Core's \
-         maps; rekey them before importing map {core_map_number}"
+        "legacy_rekey_required: Core match {core_id}: Stats holds {stale:?} that don't match \
+         Core's maps; rekey them before importing map {core_map_number}"
     ))
 }
 

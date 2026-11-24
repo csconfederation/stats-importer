@@ -170,6 +170,14 @@ impl MapGuard {
             .any(|name| !seen.insert(name.to_ascii_lowercase()))
     }
 
+    /// A real map has no Core `map_name`, so a name can't prove which map a
+    /// recording is.
+    pub fn has_unnamed_real_map(&self) -> bool {
+        self.map_numbers
+            .iter()
+            .any(|map| self.is_real_map(*map) && !self.map_names.contains_key(map))
+    }
+
     pub fn skipped_maps(&self) -> impl Iterator<Item = (i32, SkipReason)> + '_ {
         self.skipped.iter().map(|(map, reason)| (*map, *reason))
     }

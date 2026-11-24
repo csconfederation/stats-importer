@@ -1024,11 +1024,12 @@ fn validate_s3_key_order(s3_keys: &[String], core_match: &CoreMatch) -> Result<V
 /// the legacy `s3_keys` list. Empty when the match has neither.
 fn map_artifacts(core_match: &CoreMatch) -> Result<Vec<MapArtifact>> {
     // Both lists are positional and Core may write them in path order. When two
-    // maps share a name, the key-name check can't catch a swap, and a swap
-    // beside a forfeit would import the forfeited recording as the played map.
+    // maps share a name, or a map has none, the key-name check can't catch a
+    // swap, and a swap beside a forfeit would import the forfeited recording as
+    // the played map.
     let guard = &core_match.map_guard;
-    if guard.has_skipped_maps() && guard.has_repeated_map_name() {
-        bail!("ambiguous_map: a map name repeats beside a forfeit/void map; per-map positions can't be trusted");
+    if guard.has_skipped_maps() && (guard.has_repeated_map_name() || guard.has_unnamed_real_map()) {
+        bail!("ambiguous_map: a map name repeats or is missing beside a forfeit/void map; per-map positions can't be trusted");
     }
     if let Some(entries) = stats_demos::parse(core_match.stats_demos.as_ref())? {
         if stats_demos::all_keyed(&entries) {
@@ -1288,28 +1289,23 @@ fn discover_demos(
                     .ok_or_else(|| anyhow!("demo filename is not UTF-8"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let suffixed = filenames
+        let (suffixed, unnamed): (Vec<&str>, Vec<&str>) = filenames
             .iter()
-            .filter(|filename| any_suffix.is_match(filename))
-            .count();
-        if suffixed != paths.len() {
-            if suffixed != 0 {
+            .copied()
+            .partition(|filename| any_suffix.is_match(filename));
+        // Archive position is needed only for an unnamed demo that Core's map
+        // names and stats_demos can't place (a suffixed one falls back to its
+        // digit); then the bundle must be whole and all unnamed.
+        let needs_position = unnamed.iter().any(|filename| {
+            stats_demos::resolve_core_map_number(filename, None, &entries, &core_match.map_guard)
+                .is_err()
+        });
+        if needs_position {
+            if !suffixed.is_empty() {
                 bail!("BO3 archive mixes suffixed and unnamed demos; map attribution is ambiguous");
             }
-            // Archive position is needed only for a demo that Core's map
-            // names and stats_demos can't place; then the bundle must be whole.
-            let needs_position = filenames.iter().any(|filename| {
-                stats_demos::resolve_core_map_number(
-                    filename,
-                    None,
-                    &entries,
-                    &core_match.map_guard,
-                )
-                .is_err()
-            });
-            if needs_position
-                && (paths.len() as i64 != core_match.map_count
-                    || paths.len() != core_match.played_map_numbers.len())
+            if paths.len() as i64 != core_match.map_count
+                || paths.len() != core_match.played_map_numbers.len()
             {
                 bail!(
                     "cannot use Core map order for {} unnamed demos when Core records {} distinct played maps",
@@ -2020,7 +2016,7 @@ async fn process_match(
                 "legacy_rekey_required",
                 None,
                 Some(format!(
-                    "Stats holds {stale:?} outside Core match {}'s maps {:?}: a legacy \
+                    "Stats holds {stale:?} that don't match Core match {}'s maps {:?}: a legacy \
                      positional id would survive beside the canonical import; rekey it first",
                     core_match.match_id, core_match.played_map_numbers
                 )),
@@ -4300,6 +4296,93 @@ mod tests {
             rows[1].clone(),
         ]);
         assert_eq!(map_artifacts(&core).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn per_map_positions_are_ambiguous_when_a_map_beside_a_forfeit_has_no_core_name() {
+        // Both recordings are Nuke; with one map unnamed, a swap passes the name check.
+        let nuke_lists = |core: &mut CoreMatch| {
+            core.stats_demos = Some(json!([
+                {"map": "de_nuke", "demo_path": "/d/a.dem", "s3_key": "s20/M1/a-de_nuke.dem.zip"},
+                {"map": "de_nuke", "demo_path": "/d/b.dem", "s3_key": "s20/M1/b-de_nuke.dem.zip"},
+            ]));
+            core.s3_keys = Some(json!([
+                "s20/M1/a-de_nuke.dem.zip",
+                "s20/M1/b-de_nuke.dem.zip"
+            ]));
+        };
+        // Forfeited map 1 unnamed, played map 2 Nuke; then the reverse.
+        let mut unnamed_forfeit = forfeit::test_rows::played(9001, 1, 0, 13);
+        unnamed_forfeit.is_forfeit = true;
+        let mut named_forfeit = named_map(9001, 1, 0, 13, "de_nuke");
+        named_forfeit.is_forfeit = true;
+        for rows in [
+            [unnamed_forfeit, named_map(9001, 2, 13, 5, "de_nuke")],
+            [named_forfeit, forfeit::test_rows::played(9001, 2, 13, 5)],
+        ] {
+            let mut core = guarded(9001, &rows);
+            core.scored_map_names = vec!["de_nuke".into(), "de_nuke".into()];
+            core.scored_map_numbers = vec![1, 2];
+            nuke_lists(&mut core);
+            let error = map_artifacts(&core).unwrap_err();
+            assert!(format!("{error:#}").contains("ambiguous_map"), "{error:#}");
+            core.stats_demos = None;
+            let error = map_artifacts(&core).unwrap_err();
+            assert!(format!("{error:#}").contains("ambiguous_map"), "{error:#}");
+        }
+
+        // An unnamed unplayed placeholder (a 2-0 sweep's map 3) doesn't block.
+        let mut core = bo3_map_one_forfeited();
+        let mut placeholder = forfeit::test_rows::played(9001, 3, 0, 0);
+        placeholder.has_winner = false;
+        let mut forfeited = named_map(9001, 1, 0, 13, "de_anubis");
+        forfeited.is_forfeit = true;
+        core.map_guard =
+            MapGuard::from_rows(&[forfeited, named_map(9001, 2, 13, 5, "de_nuke"), placeholder]);
+        core.stats_demos = Some(json!([
+            {"map": null, "demo_path": null, "s3_key": null},
+            {"map": "de_nuke", "demo_path": "/d/b.dem", "s3_key": "s20/M1/b-de_nuke.dem.zip"},
+        ]));
+        assert_eq!(map_artifacts(&core).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_partial_bundle_mixing_suffixed_and_unnamed_demos_resolves_by_core_map_name() {
+        let root = test_path("partial-mixed-names");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("s20-mid9001-0_de_nuke.dem"), b"a").unwrap();
+        fs::write(root.join("de_mirage.dem"), b"b").unwrap();
+        let mut core = guarded(
+            9001,
+            &[
+                named_map(9001, 1, 13, 5, "de_nuke"),
+                named_map(9001, 2, 9, 13, "de_mirage"),
+                named_map(9001, 3, 13, 7, "de_inferno"),
+            ],
+        );
+        core.played_map_numbers = vec![1, 2, 3];
+        core.map_count = 3;
+        let found = discover_demos(&root, &core, &HashSet::from([9001])).unwrap();
+        let mut resolved: Vec<_> = found
+            .iter()
+            .map(|demo| (demo.relative_path.as_str(), demo.stats_match_id.as_str()))
+            .collect();
+        resolved.sort();
+        assert_eq!(
+            resolved,
+            [
+                ("de_mirage.dem", "9001_1"),
+                ("s20-mid9001-0_de_nuke.dem", "9001_0")
+            ]
+        );
+        // An unnamed demo only archive position could place still can't mix.
+        fs::rename(root.join("de_mirage.dem"), root.join("x.dem")).unwrap();
+        let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mixes suffixed and unnamed"),
+            "{error:#}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

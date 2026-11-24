@@ -112,7 +112,8 @@ pub fn normalized_demo_basename(value: &str) -> String {
 /// can share `-0_`, Core-planning #242), and Core lists recordings in path order
 /// when it can't resolve the veto order, so neither is trusted over Core's map
 /// names. In order:
-/// - the one Core map whose `map_name` the filename contains;
+/// - the one Core map whose `map_name` the filename contains, unless a real map
+///   has no name (it may be the same map);
 /// - if the match has a forfeit/void map, nothing else: reject;
 /// - the `stats_demos` entry naming this file, else `fallback` (the digit or
 ///   archive position); when the filename names several Core maps (one map
@@ -127,13 +128,16 @@ pub fn resolve_core_map_number(
     guard: &MapGuard,
 ) -> Result<i32> {
     let named = guard.map_numbers_named_in(filename);
+    let unnamed_beside_skip = guard.has_skipped_maps() && guard.has_unnamed_real_map();
     if let [number] = named.as_slice() {
-        return Ok(*number);
+        if !unnamed_beside_skip {
+            return Ok(*number);
+        }
     }
     if guard.has_skipped_maps() {
         bail!(
-            "{filename} names Core map(s) {named:?}, not exactly one, and the match has \
-             forfeit/void maps"
+            "{filename} names Core map(s) {named:?}, which can't prove its map, and the match \
+             has forfeit/void maps"
         );
     }
     let name = normalized_demo_basename(filename);
@@ -226,6 +230,22 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(!all_keyed(&entries));
+    }
+
+    #[test]
+    fn a_unique_name_proves_nothing_beside_an_unnamed_forfeited_map() {
+        // Map 1's forfeited recording may also be Nuke.
+        let mut forfeited = played(9001, 1, 0, 13);
+        forfeited.is_forfeit = true;
+        let guard = MapGuard::from_rows(&[forfeited.clone(), named(9001, 2, "de_nuke")]);
+        let filename = "s20-mid9001-0_de_nuke.dem";
+        assert!(resolve_core_map_number(filename, Some(1), &[], &guard).is_err());
+        forfeited.map_name = Some("de_anubis".to_owned());
+        let guard = MapGuard::from_rows(&[forfeited, named(9001, 2, "de_nuke")]);
+        assert_eq!(
+            resolve_core_map_number(filename, Some(1), &[], &guard).unwrap(),
+            2
+        );
     }
 
     #[test]
