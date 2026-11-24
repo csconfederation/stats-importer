@@ -13,6 +13,7 @@ use sqlx::{FromRow, PgPool};
 mod backfill;
 mod forfeit;
 mod stats_demos;
+mod stats_ids;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -171,6 +172,8 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         Err(_) => file_path,
     };
 
+    let client = reqwest::Client::new();
+    let stats_url = env::var("STATS_API_URL").expect("STATS_API_URL expected");
     let mut core_map_number = core_map_number(filename, match_info.is_series)?;
     if let Some(core_id) = match_info.core_regulation_id {
         let guard = forfeit::fetch_match_guard(pool, core_id).await?;
@@ -190,6 +193,10 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
                 reason.describe()
             ));
         }
+        if match_info.is_series {
+            let existing = stats_ids::fetch(&client, &stats_url, core_id).await?;
+            directory_rekey_check(core_id, &existing, &guard, core_map_number)?;
+        }
     }
     let map_num_str = if match_info.is_series {
         format!("_{}", core_map_number - 1)
@@ -207,11 +214,7 @@ async fn handle_file(filename: &str, path: &PathBuf, args: Args, pool: &PgPool) 
         fix_core_scores: args.fix_core_scores.unwrap_or(false),
         fix_team_names: args.fix_team_names.unwrap_or(false),
     };
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/add-match",
-        env::var("STATS_API_URL").expect("STATS_API_URL expected")
-    );
+    let url = format!("{stats_url}/api/add-match");
     let resp = client.post(url).json(&body).send().await?;
     if resp.status() != 200 {
         return Err(anyhow!("{}", resp.status()));
@@ -323,6 +326,24 @@ fn direct_import_skip(
     core_map_number: i32,
 ) -> Option<forfeit::SkipReason> {
     guard.skip_reason(core_map_number)
+}
+
+/// A series file writes `{id}_{map - 1}`; a legacy positional id for another
+/// map would survive beside it as a duplicate.
+fn directory_rekey_check(
+    core_id: i64,
+    existing: &[String],
+    guard: &forfeit::MapGuard,
+    core_map_number: i32,
+) -> Result<()> {
+    let stale = stats_ids::stale(core_id, existing, guard, Some(core_map_number));
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "legacy_rekey_required: Core match {core_id}: Stats holds {stale:?} outside Core's \
+         maps; rekey them before importing map {core_map_number}"
+    ))
 }
 
 fn is_combine_type(match_type: &str) -> bool {
@@ -465,9 +486,9 @@ mod tests {
     use crate::stats_demos::resolve_core_map_number;
 
     use super::{
-        core_map_number, demo_url_matches_filename, direct_import_skip, forfeit,
-        legacy_file_is_combine, match_info, select_match_source, split_candidates, stats_demos,
-        stats_match_type, Args, CoreMatch, MatchSource,
+        core_map_number, demo_url_matches_filename, direct_import_skip, directory_rekey_check,
+        forfeit, legacy_file_is_combine, match_info, select_match_source, split_candidates,
+        stats_demos, stats_match_type, Args, CoreMatch, MatchSource,
     };
 
     fn args() -> Args {
@@ -964,5 +985,24 @@ mod tests {
             direct_import_skip(&void, 1),
             Some(forfeit::SkipReason::ReviewedVoid)
         );
+    }
+
+    #[test]
+    fn directory_import_blocks_a_legacy_positional_id_beside_its_canonical_target() {
+        // Maps 1, 3 were stored positionally as `_0`, `_1`; map 3 now writes `_2`.
+        let gap = guard(&[
+            forfeit::test_rows::played(9001, 1, 13, 5),
+            forfeit::test_rows::played(9001, 3, 13, 7),
+        ]);
+        let legacy = ["9001_0".to_owned(), "9001_1".to_owned()];
+        let error = directory_rekey_check(9001, &legacy, &gap, 3).unwrap_err();
+        assert!(
+            error.to_string().starts_with("legacy_rekey_required")
+                && error.to_string().contains("9001_1"),
+            "{error}"
+        );
+        let canonical = ["9001_0".to_owned(), "9001_2".to_owned()];
+        directory_rekey_check(9001, &canonical, &gap, 3).unwrap();
+        directory_rekey_check(9001, &[], &gap, 3).unwrap();
     }
 }

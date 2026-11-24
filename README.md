@@ -58,6 +58,10 @@ displaced ID are retained in the ledger. An archive containing fewer demos than
 Core's played-map count is recorded as `partial_archive`, but each independently
 attributable demo is still validated and recovered.
 
+Before a BO3 import, `backfill` and `--directory` list the match's Stats ids via
+`STATS_API_URL/graphql`. If any `{id}_n` row names no Core map (a legacy
+positional id), the match stops as `legacy_rekey_required` until that row is rekeyed.
+
 Review/apply binds `parserOutputChecksum` to the canonical repair inputs rather
 than the worker's raw JSON serialization. The endpoint also records
 `rawParserOutputChecksum` for audit: historical demoScrape output contains

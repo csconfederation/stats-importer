@@ -6,7 +6,7 @@
 //! import played stats" (D66), so adjusted non-forfeit maps such as S17 `6034`
 //! (official `0-13`) and legitimate `13-0` maps are never classified here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use sqlx::{FromRow, PgPool};
@@ -95,6 +95,10 @@ pub struct MapGuard {
     has_unskipped_played_map: bool,
     /// Core's `map_name` per `map_number`, for maps that have one.
     map_names: BTreeMap<i32, String>,
+    map_numbers: BTreeSet<i32>,
+    /// Highest map that was played, forfeited, or audited. Later rows are the
+    /// unplayed placeholders a decided BO3 keeps (a 2-0 sweep's map 3).
+    last_real_map: Option<i32>,
 }
 
 impl MapGuard {
@@ -104,15 +108,20 @@ impl MapGuard {
             if let Some(name) = row.map_name.as_deref().filter(|name| !name.is_empty()) {
                 guard.map_names.insert(row.map_number, name.to_owned());
             }
-            match skip_reason(row) {
+            guard.map_numbers.insert(row.map_number);
+            let scored = row.has_winner || row.home_score != 0 || row.away_score != 0;
+            let reason = skip_reason(row);
+            if scored || row.has_audit || reason.is_some() {
+                guard.last_real_map = guard.last_real_map.max(Some(row.map_number));
+            }
+            match reason {
                 Some(reason) => {
                     guard.skipped.insert(row.map_number, reason);
                 }
                 None => {
                     // Same "played" test as the season query: a BO3's unplayed
                     // map-3 placeholder (0-0, no winner) is not a played map.
-                    guard.has_unskipped_played_map |=
-                        row.has_winner || row.home_score != 0 || row.away_score != 0;
+                    guard.has_unskipped_played_map |= scored;
                 }
             }
         }
@@ -144,6 +153,21 @@ impl MapGuard {
             .filter(|(_, name)| filename.contains(&name.to_ascii_lowercase()))
             .map(|(number, _)| *number)
             .collect()
+    }
+
+    /// A Core map, not a trailing placeholder. BO3 maps are played in order, so
+    /// a 0-0 map before a played one is a reversed forfeit, not a placeholder.
+    pub fn is_real_map(&self, map_number: i32) -> bool {
+        self.map_numbers.contains(&map_number)
+            && self.last_real_map.is_some_and(|last| map_number <= last)
+    }
+
+    /// Two Core maps share a `map_name` (one map played twice).
+    pub fn has_repeated_map_name(&self) -> bool {
+        let mut seen = BTreeSet::new();
+        self.map_names
+            .values()
+            .any(|name| !seen.insert(name.to_ascii_lowercase()))
     }
 
     pub fn skipped_maps(&self) -> impl Iterator<Item = (i32, SkipReason)> + '_ {
