@@ -3,7 +3,6 @@
 //! Stats replaces only the id it is sent, so a canonical import beside such a
 //! row leaves a duplicate map; those rows need a rekey first.
 
-use std::collections::HashSet;
 use std::future::Future;
 
 use anyhow::{bail, Context, Result};
@@ -12,12 +11,13 @@ use serde_json::{json, Value};
 
 use crate::forfeit::MapGuard;
 
-// Stats' findMany returns 1,000 rows unless `take` is set, so page explicitly.
+// Stats' findMany returns 1,000 rows unless `take` is set, so page explicitly,
+// by id: an offset page would skip a row when an earlier one is deleted.
 // Prisma 5.22 doesn't escape `_` in `startsWith` (a LIKE wildcard), so `fetch`
 // keeps only the exact prefix.
-const QUERY: &str = "query($prefix: String!, $skip: Int!, $take: Int!) { \
-    findManyMatch(where: { matchId: { startsWith: $prefix } }, orderBy: [{ id: asc }], \
-    take: $take, skip: $skip) { matchId mapName } }";
+const QUERY: &str = "query($prefix: String!, $after: Int!, $take: Int!) { \
+    findManyMatch(where: { matchId: { startsWith: $prefix }, id: { gt: $after } }, \
+    orderBy: [{ id: asc }], take: $take) { id matchId mapName } }";
 const PAGE: usize = 1000;
 /// A truncated list would hide a stale row, so running past this fails.
 const MAX_PAGES: usize = 100;
@@ -33,10 +33,10 @@ pub struct StatsMatch {
 pub async fn fetch(client: &Client, stats_url: &str, match_id: i64) -> Result<Vec<StatsMatch>> {
     let prefix = format!("{match_id}_");
     let url = format!("{}/graphql", stats_url.trim_end_matches('/'));
-    let rows = collect_pages(|skip| {
+    let rows = collect_pages(|after| {
         let request = client.post(&url).json(&json!({
             "query": QUERY,
-            "variables": { "prefix": prefix, "skip": skip, "take": PAGE },
+            "variables": { "prefix": prefix, "after": after, "take": PAGE },
         }));
         async move {
             let response = request
@@ -58,23 +58,25 @@ pub async fn fetch(client: &Client, stats_url: &str, match_id: i64) -> Result<Ve
         .collect())
 }
 
-/// Reads `PAGE`-sized pages until a short one, deduping by id (skip-based pages
-/// can shift under concurrent writes).
+/// Reads `PAGE`-sized pages of `(id, row)` after the last id seen (Stats ids
+/// start at 1) until a short one.
 async fn collect_pages<F, Fut>(mut page: F) -> Result<Vec<StatsMatch>>
 where
-    F: FnMut(usize) -> Fut,
-    Fut: Future<Output = Result<Vec<StatsMatch>>>,
+    F: FnMut(i64) -> Fut,
+    Fut: Future<Output = Result<Vec<(i64, StatsMatch)>>>,
 {
-    let mut seen = HashSet::new();
+    let mut after = 0;
     let mut rows = Vec::new();
-    for index in 0..MAX_PAGES {
-        let batch = page(index * PAGE).await?;
+    for _ in 0..MAX_PAGES {
+        let batch = page(after).await?;
         let full = batch.len() >= PAGE;
-        rows.extend(
-            batch
-                .into_iter()
-                .filter(|row| seen.insert(row.match_id.clone())),
-        );
+        if let Some(&(last, _)) = batch.last() {
+            if last <= after {
+                bail!("Stats GraphQL findManyMatch returned id {last} after cursor {after}");
+            }
+            after = last;
+        }
+        rows.extend(batch.into_iter().map(|(_, row)| row));
         if !full {
             return Ok(rows);
         }
@@ -82,7 +84,7 @@ where
     bail!("Stats GraphQL findManyMatch returned more than {MAX_PAGES} pages of {PAGE}")
 }
 
-fn parse(success: bool, body: &Value) -> Result<Vec<StatsMatch>> {
+fn parse(success: bool, body: &Value) -> Result<Vec<(i64, StatsMatch)>> {
     if !success || body.get("errors").is_some_and(|errors| !errors.is_null()) {
         bail!("Stats GraphQL findManyMatch failed: {body}");
     }
@@ -100,18 +102,26 @@ fn parse(success: bool, body: &Value) -> Result<Vec<StatsMatch>> {
                     .map(str::to_owned)
                     .with_context(|| format!("Stats match row has no {name}: {row}"))
             };
-            Ok(StatsMatch {
-                match_id: field("matchId")?,
-                map_name: field("mapName")?,
-            })
+            // GraphQL `ID` serializes as a string.
+            let id = row
+                .get("id")
+                .and_then(|id| id.as_i64().or_else(|| id.as_str()?.parse().ok()))
+                .with_context(|| format!("Stats match row has no integer id: {row}"))?;
+            Ok((
+                id,
+                StatsMatch {
+                    match_id: field("matchId")?,
+                    map_name: field("mapName")?,
+                },
+            ))
         })
         .collect()
 }
 
 /// Existing ids of this match that hold no Core map other than `writing`: the
 /// suffix isn't canonical (`_01`), Stats recorded a different map there than
-/// Core (even at `writing`, which the import would overwrite), or the map
-/// (`n + 1`) is not real (see `MapGuard::is_real_map`). The name check catches a
+/// Core, the row sits at `writing`'s key but Core has no name to confirm it, or
+/// the map (`n + 1`) is not real (see `MapGuard::is_real_map`). The name check catches a
 /// played map stored under a forfeited map's key. Ids of other matches that
 /// share the prefix are ignored.
 pub fn stale(
@@ -146,7 +156,12 @@ pub fn stale(
             {
                 return true;
             }
-            Some(map) != writing && !guard.is_real_map(map)
+            if Some(map) == writing {
+                // The import would overwrite this row; without Core's name,
+                // nothing shows it is already this map.
+                return guard.map_name(map).is_none();
+            }
+            !guard.is_real_map(map)
         })
         .map(|row| row.match_id.clone())
         .collect();
@@ -269,7 +284,8 @@ mod tests {
 
     #[test]
     fn the_map_being_written_and_other_matches_are_not_stale() {
-        let guard = MapGuard::from_rows(&[played(9001, 1, 13, 5), placeholder(9001, 2)]);
+        let guard =
+            MapGuard::from_rows(&[played(9001, 1, 13, 5), named(placeholder(9001, 2), "de_x")]);
         assert!(stale(9001, &unnamed(&["9001_1"]), &guard, Some(2)).is_empty());
         assert!(stale(
             9001,
@@ -300,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn a_row_at_the_key_being_written_is_stale_when_core_has_no_name_for_it() {
+        // Core map 2 is unnamed; `_1` holds map 3's Mirage under a legacy key.
+        let guard = MapGuard::from_rows(&[
+            named(played(9001, 1, 13, 5), "de_dust2"),
+            played(9001, 2, 13, 7),
+            named(played(9001, 3, 9, 13), "de_mirage"),
+        ]);
+        let legacy = rows(&[("9001_1", "de_mirage")]);
+        assert_eq!(stale(9001, &legacy, &guard, Some(2)), ids(&["9001_1"]));
+        // The full-series check can't tell either way, so it leaves the row.
+        assert!(stale(9001, &legacy, &guard, None).is_empty());
+    }
+
+    #[test]
     fn a_zero_padded_suffix_is_stale_even_at_the_key_being_written() {
         let guard = MapGuard::from_rows(&[
             named(played(9001, 1, 13, 5), "de_dust2"),
@@ -318,44 +348,65 @@ mod tests {
         assert!(stale(9001, &canonical, &guard, Some(2)).is_empty());
     }
 
-    fn page_of(start: usize, len: usize) -> Vec<StatsMatch> {
-        (start..start + len)
-            .map(|n| StatsMatch {
-                match_id: format!("9001_{n}"),
-                map_name: "de_x".to_owned(),
+    /// Rows with Stats ids `start + 1..=start + len`.
+    fn page_of(start: i64, len: usize) -> Vec<(i64, StatsMatch)> {
+        (start + 1..=start + len as i64)
+            .map(|id| {
+                (
+                    id,
+                    StatsMatch {
+                        match_id: format!("9001_{id}"),
+                        map_name: "de_x".to_owned(),
+                    },
+                )
             })
             .collect()
     }
 
     #[tokio::test]
-    async fn pages_are_read_until_a_short_one() {
-        let mut skips = Vec::new();
-        let rows = collect_pages(|skip| {
-            skips.push(skip);
-            // The second page overlaps the first by one row (a concurrent insert).
-            let page = match skip {
-                0 => page_of(0, PAGE),
-                _ => page_of(PAGE - 1, 3),
+    async fn pages_follow_the_last_id_until_a_short_one() {
+        let mut cursors = Vec::new();
+        let rows = collect_pages(|after| {
+            cursors.push(after);
+            // Ids have gaps (deleted rows); the cursor follows the last one read.
+            let page = match after {
+                0 => page_of(10, PAGE),
+                _ => page_of(after + 5, 3),
             };
             async move { Ok(page) }
         })
         .await
         .unwrap();
-        assert_eq!(skips, [0, PAGE]);
-        assert_eq!(rows.len(), PAGE + 2);
+        assert_eq!(cursors, [0, 10 + PAGE as i64]);
+        assert_eq!(rows.len(), PAGE + 3);
     }
 
     #[tokio::test]
     async fn a_list_past_the_page_cap_fails_instead_of_truncating() {
-        let result = collect_pages(|skip| async move { Ok(page_of(skip, PAGE)) }).await;
+        let result = collect_pages(|after| async move { Ok(page_of(after, PAGE)) }).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cursor_that_does_not_advance_fails_closed() {
+        // A server ignoring `gt` returns the first page again.
+        let result = collect_pages(|_| async move { Ok(page_of(0, PAGE)) }).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("after cursor"), "{error}");
     }
 
     #[test]
     fn graphql_errors_and_missing_data_fail_closed() {
-        let ok =
-            json!({ "data": { "findManyMatch": [{ "matchId": "9001_0", "mapName": "de_nuke" }] } });
-        assert_eq!(parse(true, &ok).unwrap(), rows(&[("9001_0", "de_nuke")]));
+        let ok = json!({ "data": { "findManyMatch": [
+            { "id": "7", "matchId": "9001_0", "mapName": "de_nuke" },
+            { "id": 8, "matchId": "9001_1", "mapName": "de_mirage" },
+        ] } });
+        let parsed = parse(true, &ok).unwrap();
+        assert_eq!(parsed.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7, 8]);
+        assert_eq!(
+            parsed.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+            rows(&[("9001_0", "de_nuke"), ("9001_1", "de_mirage")])
+        );
         assert!(parse(false, &ok).is_err());
         assert!(parse(
             true,
@@ -365,7 +416,12 @@ mod tests {
         assert!(parse(true, &json!({ "data": null })).is_err());
         assert!(parse(
             true,
-            &json!({ "data": { "findManyMatch": [{ "matchId": "9001_0" }] } })
+            &json!({ "data": { "findManyMatch": [{ "id": "7", "matchId": "9001_0" }] } })
+        )
+        .is_err());
+        assert!(parse(
+            true,
+            &json!({ "data": { "findManyMatch": [{ "matchId": "9001_0", "mapName": "de_nuke" }] } })
         )
         .is_err());
     }

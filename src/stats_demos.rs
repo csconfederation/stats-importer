@@ -163,6 +163,10 @@ pub fn resolve_core_map_number(
     if !named.is_empty() && !named.contains(&map) {
         bail!("{filename} resolves to Core map {map} but names Core maps {named:?}");
     }
+    // A fallback digit or stats_demos index can run past Core's maps.
+    if !guard.has_map(map) {
+        bail!("{filename} resolves to Core map {map}, which Core has no row for");
+    }
     Ok(map)
 }
 
@@ -245,6 +249,23 @@ mod tests {
         assert_eq!(
             resolve_core_map_number(filename, Some(1), &[], &guard).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn a_fallback_past_cores_maps_fails_closed() {
+        // `--directory` and bundles fall back to the filename digit.
+        let guard = MapGuard::from_rows(&[
+            played(9001, 1, 13, 5),
+            played(9001, 2, 9, 13),
+            played(9001, 3, 13, 7),
+        ]);
+        let filename = "s20-mid9001-4_unknown.dem";
+        assert!(resolve_core_map_number(filename, Some(5), &[], &guard).is_err());
+        assert!(resolve_core_map_number(filename, Some(3), &[], &MapGuard::default()).is_err());
+        assert_eq!(
+            resolve_core_map_number(filename, Some(3), &[], &guard).unwrap(),
+            3
         );
     }
 

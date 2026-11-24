@@ -990,23 +990,28 @@ mod tests {
     #[test]
     fn directory_import_blocks_a_legacy_positional_id_beside_its_canonical_target() {
         // Maps 1, 3 were stored positionally as `_0`, `_1`; map 3 now writes `_2`.
-        let gap = guard(&[
-            forfeit::test_rows::played(9001, 1, 13, 5),
-            forfeit::test_rows::played(9001, 3, 13, 7),
-        ]);
-        let row = |id: &str| stats_ids::StatsMatch {
+        let gap = guard(&[named(1, "de_dust2", false), named(3, "de_mirage", false)]);
+        let row = |id: &str, map: &str| stats_ids::StatsMatch {
             match_id: id.to_owned(),
-            map_name: "de_x".to_owned(),
+            map_name: map.to_owned(),
         };
-        let legacy = [row("9001_0"), row("9001_1")];
+        let legacy = [row("9001_0", "de_dust2"), row("9001_1", "de_mirage")];
         let error = directory_rekey_check(9001, &legacy, &gap, 3).unwrap_err();
         assert!(
             error.to_string().starts_with("legacy_rekey_required")
                 && error.to_string().contains("9001_1"),
             "{error}"
         );
-        let canonical = [row("9001_0"), row("9001_2")];
+        let canonical = [row("9001_0", "de_dust2"), row("9001_2", "de_mirage")];
         directory_rekey_check(9001, &canonical, &gap, 3).unwrap();
         directory_rekey_check(9001, &[], &gap, 3).unwrap();
+        // Without Core's map_name, nothing proves `_2` already holds map 3.
+        let unnamed = guard(&[
+            forfeit::test_rows::played(9001, 1, 13, 5),
+            forfeit::test_rows::played(9001, 3, 13, 7),
+        ]);
+        let error = directory_rekey_check(9001, &canonical, &unnamed, 3).unwrap_err();
+        assert!(error.to_string().contains("9001_2"), "{error}");
+        directory_rekey_check(9001, &canonical[..1], &unnamed, 3).unwrap();
     }
 }

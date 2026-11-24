@@ -3657,8 +3657,14 @@ mod tests {
         fs::write(root.join("s11-mid123-0_root.dem"), b"a").unwrap();
         fs::write(root.join("demo/deeper/s11-mid123-1_nested.DEM"), b"b").unwrap();
         fs::write(root.join("demos/ignore.txt"), b"c").unwrap();
-        let mut found =
-            discover_demos(&root, &core_match(123, true), &HashSet::from([123])).unwrap();
+        let core = guarded(
+            123,
+            &[
+                forfeit::test_rows::played(123, 1, 13, 5),
+                forfeit::test_rows::played(123, 2, 13, 7),
+            ],
+        );
+        let mut found = discover_demos(&root, &core, &HashSet::from([123])).unwrap();
         found.sort_by(|a, b| a.stats_match_id.cmp(&b.stats_match_id));
         assert_eq!(
             found
@@ -3687,7 +3693,15 @@ mod tests {
         let root = test_path("normalize-mid");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("s12-mid999-2_mirage.dem"), b"demo").unwrap();
-        let found = discover_demos(&root, &core_match(456, true), &HashSet::from([456])).unwrap();
+        let core = guarded(
+            456,
+            &[
+                forfeit::test_rows::played(456, 1, 13, 5),
+                forfeit::test_rows::played(456, 2, 5, 13),
+                forfeit::test_rows::played(456, 3, 13, 9),
+            ],
+        );
+        let found = discover_demos(&root, &core, &HashSet::from([456])).unwrap();
         assert_eq!(found[0].stats_match_id, "456_2");
         assert_eq!(found[0].identity_source, "core_id_normalized");
         fs::remove_dir_all(root).unwrap();
@@ -3734,7 +3748,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("first.dem"), b"a").unwrap();
         fs::write(root.join("second.dem"), b"b").unwrap();
-        let mut core = core_match(456, true);
+        let mut core = guarded(
+            456,
+            &[
+                forfeit::test_rows::played(456, 1, 13, 5),
+                forfeit::test_rows::played(456, 3, 13, 9),
+            ],
+        );
         core.played_map_numbers = vec![1, 3];
         core.map_count = 2;
         let found = discover_demos(&root, &core, &HashSet::from([456])).unwrap();
@@ -4344,6 +4364,30 @@ mod tests {
             {"map": "de_nuke", "demo_path": "/d/b.dem", "s3_key": "s20/M1/b-de_nuke.dem.zip"},
         ]));
         assert_eq!(map_artifacts(&core).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_suffix_past_cores_maps_fails_closed() {
+        let root = test_path("partial-mixed-past-core");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("de_mirage.dem"), b"a").unwrap();
+        fs::write(root.join("s20-mid9001-4_unknown.dem"), b"b").unwrap();
+        let mut core = guarded(
+            9001,
+            &[
+                named_map(9001, 1, 13, 5, "de_nuke"),
+                named_map(9001, 2, 9, 13, "de_mirage"),
+                named_map(9001, 3, 13, 7, "de_inferno"),
+            ],
+        );
+        core.played_map_numbers = vec![1, 2, 3];
+        core.map_count = 3;
+        let error = discover_demos(&root, &core, &HashSet::from([9001])).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Core map 5, which Core has no row for"),
+            "{error:#}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
